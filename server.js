@@ -14,13 +14,9 @@ let trigger = false;
 // Endpoint called by your LinkRunner webhook when form is submitted
 // Expect header: x-webhook-secret: <SECRET>
 app.post('/form', (req, res) => {
-  const secret = req.headers['x-webhook-secret'] || '';
-  if (secret !== SECRET) {
-    return res.status(401).send('unauthorized');
-  }
-  trigger = true;
-  return res.status(200).send('triggered');
-});
+    trigger = true;
+    res.sendStatus(200);
+  });
 
 // ESP32 polls this endpoint
 // Expect header: x-poll-secret: <SECRET>
