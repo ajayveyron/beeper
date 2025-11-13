@@ -3,6 +3,7 @@
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <esp_wifi.h>
 
 // ---------- Cloud configuration ----------
 const char* backendBaseUrl = "https://beeper-ps1z.onrender.com";
@@ -31,10 +32,14 @@ unsigned long lastPoll = 0;
 
 // ---------- Helper ----------
 String sanitizedMac() {
-  String mac = WiFi.macAddress();
-  mac.toUpperCase();
-  mac.replace(":", "");
-  return mac;
+  uint8_t mac[6] = {0};
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+  char buffer[13];
+  snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  return String(buffer);
 }
 
 void loadStoredConfig() {
