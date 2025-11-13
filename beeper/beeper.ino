@@ -221,15 +221,31 @@ void sendConfigForm() {
       "<div class='device-meta'>Device ID: <strong>" + safeDeviceId + "</strong></div>"
       "</div>"
       "<script>"
-      "document.querySelectorAll('[data-copy]').forEach(function(btn){"
-      "btn.addEventListener('click',function(){"
+      "(function(){"
+      "function legacyCopy(text){"
+      "var textarea=document.createElement('textarea');"
+      "textarea.value=text;"
+      "textarea.setAttribute('readonly','');"
+      "textarea.style.position='absolute';"
+      "textarea.style.left='-9999px';"
+      "document.body.appendChild(textarea);"
+      "var selected=document.getSelection();"
+      "textarea.select();"
+      "try{document.execCommand('copy');document.body.removeChild(textarea);if(selected){selected.removeAllRanges();}"
+      "return true;}catch(err){document.body.removeChild(textarea);if(selected){selected.removeAllRanges();}return false;}"
+      "}"
+      "function handleCopy(btn){"
       "var value=btn.getAttribute('data-copy');"
-      "navigator.clipboard.writeText(value).then(function(){"
-      "var previous=btn.textContent;btn.textContent='Copied!';"
-      "setTimeout(function(){btn.textContent=previous;},1800);"
-      "}).catch(function(){btn.textContent='Retry copy';});"
-      "});"
-      "});"
+      "if(!value){return;}"
+      "var original=btn.textContent;"
+      "var onSuccess=function(){btn.textContent='Copied!';btn.disabled=true;setTimeout(function(){btn.textContent=original;btn.disabled=false;},1800);};"
+      "var onFailure=function(){btn.textContent='Copy manually';setTimeout(function(){btn.textContent=original;},2000);};"
+      "if(navigator.clipboard&&navigator.clipboard.writeText){"
+      "navigator.clipboard.writeText(value).then(onSuccess).catch(function(){legacyCopy(value)?onSuccess():onFailure();});"
+      "}else{legacyCopy(value)?onSuccess():onFailure();}"
+      "}"
+      "document.querySelectorAll('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){handleCopy(btn);});});"
+      "})();"
       "</script>"
       "</body></html>";
   configServer.send(200, "text/html", form);
@@ -295,7 +311,7 @@ void handleConfigSave() {
                     "<button class='copy-btn' type='button' data-copy='" + safeLookupUrl + "'>Copy Lookup URL</button>"
                     "<p style='margin-top:0.9rem;font-size:0.9rem;color:#8f9feb;'>Bookmark the page or share it with your automation engineer.</p>"
                     "</div>"
-                    "</div><script>document.querySelectorAll('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var value=btn.getAttribute('data-copy');navigator.clipboard.writeText(value).then(function(){var original=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=original;},1600);}).catch(function(){btn.textContent='Retry copy';setTimeout(function(){btn.textContent='Copy Lookup URL';},1600);});});});</script></body></html>");
+                    "</div><script>(function(){function legacyCopy(text){var textarea=document.createElement('textarea');textarea.value=text;textarea.setAttribute('readonly','');textarea.style.position='absolute';textarea.style.left='-9999px';document.body.appendChild(textarea);var selected=document.getSelection();textarea.select();try{document.execCommand('copy');document.body.removeChild(textarea);if(selected){selected.removeAllRanges();}return true;}catch(err){document.body.removeChild(textarea);if(selected){selected.removeAllRanges();}return false;}}function handleCopy(btn){var value=btn.getAttribute('data-copy');if(!value){return;}var original=btn.textContent;var onSuccess=function(){btn.textContent='Copied!';btn.disabled=true;setTimeout(function(){btn.textContent=original;btn.disabled=false;},1800);};var onFailure=function(){btn.textContent='Copy manually';setTimeout(function(){btn.textContent=original;},2000);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(value).then(onSuccess).catch(function(){legacyCopy(value)?onSuccess():onFailure();});}else{legacyCopy(value)?onSuccess():onFailure();}}document.querySelectorAll('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){handleCopy(btn);});});})();</script></body></html>");
   shouldRestart = true;
 }
 

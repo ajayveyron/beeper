@@ -5,7 +5,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.WEBHOOK_SECRET || 'replace_with_admin_secret';
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 
 const app = express();
 app.use(bodyParser.json());
@@ -42,6 +42,18 @@ const requireAdmin = (req, res, next) => {
 
 app.get('/', (_req, res) => res.send('relay ok'));
 
+const resolveBaseUrl = (req) => {
+  if (PUBLIC_BASE_URL) {
+    return PUBLIC_BASE_URL.replace(/\/$/, '');
+  }
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  const protocol = Array.isArray(forwardedProto)
+    ? forwardedProto[0]
+    : forwardedProto || req.protocol || 'http';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${protocol}://${host}`.replace(/\/$/, '');
+};
+
 const findDeviceByClaimCode = (claimCode, deviceId) => {
   const normalizedClaim = (claimCode || '').trim().toUpperCase();
   const normalizedDevice = (deviceId || '').trim().toUpperCase();
@@ -61,6 +73,7 @@ const findDeviceByClaimCode = (claimCode, deviceId) => {
 };
 
 app.get('/link', (req, res) => {
+  const baseUrl = resolveBaseUrl(req);
   const { claim, device } = req.query || {};
   const match = claim ? findDeviceByClaimCode(claim, device) : null;
 
@@ -100,7 +113,7 @@ app.get('/link', (req, res) => {
         </section>
       `;
     } else {
-      const webhookUrl = `${PUBLIC_BASE_URL}/api/device/webhook/${match.id}/${match.record.webhookSecret}`;
+      const webhookUrl = `${baseUrl}/api/device/webhook/${match.id}/${match.record.webhookSecret}`;
       const pollSecret = match.record.pollSecret;
       const curlCommand = `curl -X POST "${webhookUrl}" -H 'Content-Type: application/json' -d '{"trigger":true}'`;
 
@@ -378,7 +391,8 @@ app.post('/api/device/claim', (req, res) => {
   record.webhookSecret = record.webhookSecret || generateSecret();
   record.trigger = false;
 
-  const webhookUrl = `${PUBLIC_BASE_URL}/api/device/webhook/${deviceId}/${record.webhookSecret}`;
+  const baseUrl = resolveBaseUrl(req);
+  const webhookUrl = `${baseUrl}/api/device/webhook/${deviceId}/${record.webhookSecret}`;
 
   return res.json({
     ok: true,
