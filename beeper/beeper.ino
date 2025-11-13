@@ -3,6 +3,7 @@
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <DNSServer.h>
 #include <esp_wifi.h>
 
 // ---------- Cloud configuration ----------
@@ -14,21 +15,30 @@ const unsigned long pollIntervalMs = 3000;
 const unsigned long wifiConnectTimeoutMs = 20000;
 
 // ---------- Hardware ----------
-const int buzzerPin = 15; // GPIO15
+const int buzzerPin = 15;      // GPIO15
+const int resetButtonPin = 25;  // GPIO0; connect to GND when pressed
 
 // ---------- Globals ----------
 Preferences prefs;
 WebServer configServer(80);
+DNSServer dnsServer;
+
+const byte dnsPort = 53;
+IPAddress apIp(192, 168, 4, 1);
+IPAddress apNetmask(255, 255, 255, 0);
 
 String deviceId;
 String wifiSsid;
 String wifiPassword;
 String claimCode;
 String pollSecret;
+String webhookUrl;
 
 bool configMode = false;
 bool shouldRestart = false;
 unsigned long lastPoll = 0;
+unsigned long resetPressStart = 0;
+bool resetTriggerArmed = false;
 
 // ---------- Helper ----------
 String sanitizedMac() {
@@ -47,6 +57,7 @@ void loadStoredConfig() {
   wifiPassword = prefs.getString("wifi_pass", "");
   claimCode = prefs.getString("claim_code", "");
   pollSecret = prefs.getString("poll_secret", "");
+  webhookUrl = prefs.getString("webhook_url", "");
 }
 
 void saveWifiConfig(const String& ssid, const String& pass, const String& claim) {
@@ -58,11 +69,27 @@ void saveWifiConfig(const String& ssid, const String& pass, const String& claim)
   claimCode = claim;
 }
 
-void savePollSecret(const String& secret) {
+void saveClaimData(const String& secret, const String& webhook) {
   pollSecret = secret;
+  webhookUrl = webhook;
   prefs.putString("poll_secret", secret);
+  prefs.putString("webhook_url", webhook);
   prefs.remove("claim_code"); // no longer needed after claim
   claimCode = "";
+}
+
+void clearStoredConfig() {
+  prefs.remove("wifi_ssid");
+  prefs.remove("wifi_pass");
+  prefs.remove("poll_secret");
+  prefs.remove("claim_code");
+  prefs.remove("webhook_url");
+
+  wifiSsid = "";
+  wifiPassword = "";
+  pollSecret = "";
+  claimCode = "";
+  webhookUrl = "";
 }
 
 bool connectToWiFi() {
@@ -83,7 +110,7 @@ bool connectToWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Connected. IP: ");
-    Serial.println(WiFi.localIP());
+  Serial.println(WiFi.localIP());
     return true;
   }
 
@@ -92,20 +119,125 @@ bool connectToWiFi() {
 }
 
 void sendConfigForm() {
+  String ssidValue = wifiSsid;
+  ssidValue.replace("'", "&#39;");
+  String claimValue = claimCode;
+  claimValue.replace("'", "&#39;");
+  String claimLookupBase = String(backendBaseUrl) + "/link";
+  String claimLookupUrl = claimLookupBase;
+  if (!claimCode.isEmpty()) {
+    claimLookupUrl += "?claim=" + claimCode;
+  }
+  String safeDeviceId = deviceId;
+  safeDeviceId.replace("&", "&amp;");
+  safeDeviceId.replace("<", "&lt;");
+  safeDeviceId.replace(">", "&gt;");
+  safeDeviceId.replace("'", "&#39;");
+  bool hasClaimData = !pollSecret.isEmpty() && !webhookUrl.isEmpty();
+  String lookupDisplay = claimCode.isEmpty() ? claimLookupBase : claimLookupUrl;
+  String safeLookupDisplay = lookupDisplay;
+  safeLookupDisplay.replace("&", "&amp;");
+  safeLookupDisplay.replace("<", "&lt;");
+  safeLookupDisplay.replace(">", "&gt;");
+  safeLookupDisplay.replace("\"", "&quot;");
+  safeLookupDisplay.replace("'", "&#39;");
+
+  String claimSection;
+  if (hasClaimData) {
+    claimSection =
+        "<section class='card success'>"
+        "<h2>Device Linked</h2>"
+        "<p>Your Beeper is already paired with the Beeper cloud. If you need the webhook credentials again, use the claim lookup link below from any browser.</p>"
+        "</section>";
+  } else {
+    claimSection =
+        "<section class='card muted'>"
+        "<h2>Next Steps</h2>"
+        "<p>After you tap <strong>Save & Reboot</strong>, the Beeper will join your Wi-Fi and register itself with the cloud. Use the lookup link to retrieve the webhook URL, poll secret, and curl command.</p>"
+        "<p class='tip'>If pairing fails, hold the hardware button for 3 seconds to return to setup mode and try again.</p>"
+        "</section>";
+  }
+
   String form =
-      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Beeper Setup</title>"
-      "<style>body{font-family:sans-serif;margin:2rem;}label{display:block;margin-top:1rem;}input{width:100%;padding:0.5rem;}"
-      "button{margin-top:1.5rem;padding:0.6rem 1rem;font-size:1rem;}</style></head><body>"
-      "<h1>Beeper Wi-Fi Setup</h1>"
-      "<p>Enter your 2.4GHz home Wi-Fi details and the claim code printed on the device card.</p>"
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<title>Beeper Setup</title>"
+      "<style>"
+      "*,*::before,*::after{box-sizing:border-box;}body{margin:0;font-family:'Segoe UI',Tahoma,sans-serif;"
+      "background:linear-gradient(135deg,#060f24,#0b1f3f);color:#0b1320;min-height:100vh;display:flex;align-items:center;"
+      "justify-content:center;padding:2.5rem;}h1,h2{margin:0;color:#0b1f3f;}p{color:#3a4661;line-height:1.5;}"
+      "code{background:#f5f7fb;border-radius:0.5rem;padding:0.75rem 1rem;display:block;word-break:break-all;"
+      "font-size:0.95rem;color:#14213d;margin-bottom:0.75rem;}"
+      ".container{max-width:760px;width:100%;display:grid;gap:1.75rem;}"
+      ".top-card{background:#ffffff;border-radius:1.25rem;padding:2.5rem 2.75rem;"
+      "box-shadow:0 35px 50px rgba(8,18,46,0.35);border:1px solid rgba(255,255,255,0.35);}"
+      ".lead{margin-top:0.75rem;margin-bottom:2rem;color:#4b5877;}"
+      "form{display:grid;gap:1.25rem;margin-top:1.75rem;}"
+      "label{display:block;font-weight:600;color:#111d2f;}"
+      "input{width:100%;margin-top:0.5rem;padding:0.85rem 1rem;border-radius:0.8rem;border:1px solid #d5dbe8;"
+      "font-size:1rem;background:#f4f6fb;transition:border-color .2s,box-shadow .2s;}"
+      "input:focus{outline:none;border-color:#3d7dff;box-shadow:0 0 0 4px rgba(61,125,255,0.15);}"
+      ".submit-btn{margin-top:0.5rem;padding:0.95rem 1.25rem;border:none;border-radius:1rem;background:#3564ff;"
+      "color:#ffffff;font-weight:700;font-size:1.05rem;cursor:pointer;transition:transform .2s,box-shadow .2s;"
+      "box-shadow:0 18px 30px rgba(53,100,255,0.3);} .submit-btn:hover{transform:translateY(-2px);"
+      "box-shadow:0 22px 35px rgba(53,100,255,0.4);} .section{margin-top:2rem;}"
+      ".card{background:#ffffff;border-radius:1.25rem;padding:2rem 2.5rem;box-shadow:0 30px 45px rgba(8,18,46,0.3);"
+      "border:1px solid rgba(255,255,255,0.4);}"
+      ".card.success{border:1px solid rgba(49,155,89,0.35);} .card.muted{background:rgba(255,255,255,0.82);"
+      "border:1px dashed rgba(57,77,109,0.4);} .info-block{margin-top:1.5rem;}"
+      ".info-header{font-weight:700;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.08em;color:#3d527d;"
+      "margin-bottom:0.75rem;}"
+      ".info-body{display:flex;flex-direction:column;gap:0.6rem;}"
+      ".copy-btn{border:none;border-radius:0.9rem;padding:0.85rem 1.1rem;font-weight:700;font-size:0.95rem;"
+      "cursor:pointer;background:#0f9d58;color:#fff;box-shadow:0 16px 28px rgba(15,157,88,0.28);transition:transform .2s,box-shadow .2s;}"
+      ".copy-btn:hover{transform:translateY(-2px);box-shadow:0 18px 32px rgba(15,157,88,0.35);}"
+      ".tip{margin-top:1.25rem;color:#3d527d;font-style:italic;}"
+      ".device-meta{margin-top:2rem;font-size:0.9rem;color:#6a7796;}"
+      "@media (max-width:640px){body{padding:1.5rem;} .top-card{padding:2rem;} .card{padding:1.75rem;} input{font-size:0.95rem;}}"
+      "</style></head><body>"
+      "<div class='container'>"
+      "<section class='top-card'>"
+      "<h1>Beeper Network Onboarding</h1>"
+      "<p class='lead'>Securely connect your device to Wi-Fi and register it with the Beeper cloud relay. Please use a 2.4GHz network for best reliability.</p>"
       "<form method='POST'>"
-      "<label>Wi-Fi SSID(2.4GHz)<input name='ssid' placeholder='Network name'/></label>"
-      "<label>Wi-Fi Password<input name='pass' type='password' placeholder='Password'/></label>"
-      "<label>Claim Code<input name='claim' placeholder='e.g. 4G7X9A'/></label>"
-      "<button type='submit'>Save & Reboot</button>"
+      "<label>Wi-Fi SSID (2.4GHz)<input name='ssid' placeholder='Network name' value='" + ssidValue + "' required></label>"
+      "<label>Wi-Fi Password<input name='pass' type='password' placeholder='Password' required></label>"
+      "<label>Claim Code<input name='claim' placeholder='e.g. 4G7X9A' value='" + claimValue + "' required></label>"
+      "<button class='submit-btn' type='submit'>Save & Reboot Device</button>"
       "</form>"
+      "</section>"
+      "<section class='section'>" + claimSection + "</section>"
+      "<section class='card info-card'>"
+      "<h2>Claim Lookup Portal</h2>"
+      "<p>After the device rejoins Wi-Fi, open this link on any phone or computer to copy the webhook URL, poll secret, and curl command using your claim code.</p>"
+      "<div class='info-block'>"
+      "<div class='info-header'>Lookup URL</div>"
+      "<div class='info-body'>"
+      "<code id='lookup-url'>" + safeLookupDisplay + "</code>"
+      "<button class='copy-btn' type='button' data-copy='" + safeLookupDisplay + "'>Copy Lookup URL</button>"
+      "</div>"
+      "</div>"
+      "<p class='tip'>You can bookmark the link or share it with your automation team.</p>"
+      "</section>"
+      "<div class='device-meta'>Device ID: <strong>" + safeDeviceId + "</strong></div>"
+      "</div>"
+      "<script>"
+      "document.querySelectorAll('[data-copy]').forEach(function(btn){"
+      "btn.addEventListener('click',function(){"
+      "var value=btn.getAttribute('data-copy');"
+      "navigator.clipboard.writeText(value).then(function(){"
+      "var previous=btn.textContent;btn.textContent='Copied!';"
+      "setTimeout(function(){btn.textContent=previous;},1800);"
+      "}).catch(function(){btn.textContent='Retry copy';});"
+      "});"
+      "});"
+      "</script>"
       "</body></html>";
   configServer.send(200, "text/html", form);
+}
+
+void sendPortalRedirect() {
+  configServer.sendHeader("Location", "http://192.168.4.1/", true);
+  configServer.send(302, "text/plain", "");
 }
 
 void handleConfigSave() {
@@ -114,17 +246,62 @@ void handleConfigSave() {
   String claim = configServer.arg("claim");
 
   if (ssid.isEmpty() || pass.isEmpty() || claim.isEmpty()) {
-    configServer.send(400, "text/plain", "Missing SSID, password, or claim code.");
+    configServer.send(400, "text/html",
+                      "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+                      "<title>Beeper Setup</title><style>body{font-family:'Segoe UI',Tahoma,sans-serif;background:#060f24;color:#fff;margin:0;"
+                      "display:flex;align-items:center;justify-content:center;height:100vh;} .panel{max-width:440px;width:90%;background:#16203d;"
+                      "border-radius:1.1rem;padding:2rem;box-shadow:0 22px 38px rgba(0,0,0,0.45);} h1{margin:0 0 1rem;font-size:1.55rem;}"
+                      "p{margin:0.5rem 0;color:#d6defa;} .link{display:inline-flex;margin-top:1.5rem;padding:0.75rem 1.2rem;border-radius:0.8rem;"
+                      "background:#3d7dff;color:#fff;text-decoration:none;font-weight:600;box-shadow:0 18px 30px rgba(61,125,255,0.32);} </style></head>"
+                      "<body><div class='panel'><h1>Missing Details</h1><p>Please fill in the Wi-Fi SSID, password, and claim code to continue.</p>"
+                      "<a class='link' href='/'>Return to setup</a></div></body></html>");
     return;
   }
 
   saveWifiConfig(ssid, pass, claim);
-  configServer.send(200, "text/plain", "Saved! Device will reboot shortly.");
+  String lookupBase = String(backendBaseUrl) + "/link";
+  String lookupUrl = lookupBase;
+  if (!claim.isEmpty()) {
+    lookupUrl += "?claim=" + claim;
+  }
+  String safeLookupUrl = lookupUrl;
+  safeLookupUrl.replace("&", "&amp;");
+  safeLookupUrl.replace("<", "&lt;");
+  safeLookupUrl.replace(">", "&gt;");
+  safeLookupUrl.replace("\"", "&quot;");
+  safeLookupUrl.replace("'", "&#39;");
+  configServer.send(200, "text/html",
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+                    "<title>Beeper Setup</title>"
+                    "<style>body{margin:0;font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(135deg,#060f24,#0b1f3f);"
+                    "color:#ffffff;display:flex;align-items:center;justify-content:center;height:100vh;padding:2rem;} .card{background:rgba(12,25,54,0.92);"
+                    "border-radius:1.25rem;padding:2.5rem;max-width:560px;width:100%;box-shadow:0 30px 45px rgba(0,0,0,0.35);text-align:center;}"
+                    ".card h1{margin:0;font-size:1.9rem;} .card p{margin:1rem 0 0;color:#d6defa;line-height:1.6;} .spinner{margin:2rem auto 0;"
+                    "width:72px;height:72px;border-radius:50%;border:6px solid rgba(255,255,255,0.15);border-top-color:#3d7dff;"
+                    "animation:spin 1.1s infinite linear;} @keyframes spin{to{transform:rotate(360deg);}} .note{margin-top:1.5rem;font-size:0.95rem;"
+                    "color:#9fb1e5;} .lookup{margin-top:1.75rem;text-align:left;background:rgba(9,16,38,0.9);padding:1.35rem;border-radius:1rem;"
+                    "box-shadow:0 18px 30px rgba(0,0,0,0.35);} .lookup h2{margin:0;font-size:1.15rem;color:#f1f4ff;}"
+                    ".lookup p{margin:0.65rem 0;color:#b7c8ff;font-size:0.95rem;line-height:1.5;} code{display:block;margin-top:0.85rem;"
+                    "padding:0.8rem 0.9rem;background:rgba(4,10,28,0.95);border-radius:0.8rem;font-family:'SFMono-Regular',ui-monospace,monospace;"
+                    "font-size:0.92rem;color:#e6ebff;word-break:break-all;} .copy-btn{margin-top:0.75rem;border:none;border-radius:0.85rem;"
+                    "padding:0.75rem 1.2rem;background:#3d7dff;color:#fff;font-weight:600;cursor:pointer;box-shadow:0 20px 34px rgba(61,125,255,0.3);"
+                    "transition:transform .2s,box-shadow .2s;} .copy-btn:hover{transform:translateY(-2px);box-shadow:0 24px 40px rgba(61,125,255,0.4);}"
+                    "</style></head><body><div class='card'><h1>Configuration Saved</h1>"
+                    "<p>Your Beeper will now finalize setup with <strong>" + ssid + "</strong>. As soon as it reconnects, it will register the webhook credentials.</p>"
+                    "<div class='spinner'></div><p class='note'>The hotspot will close automatically once the device restarts (about 10 seconds).</p>"
+                    "<div class='lookup'><h2>Retrieve your webhook details</h2>"
+                    "<p>Open the link below on any browser (Wi-Fi or cellular) and enter your claim code if prompted to copy the webhook URL, poll secret, and ready-to-run curl command.</p>"
+                    "<code id='lookup-url'>" + safeLookupUrl + "</code>"
+                    "<button class='copy-btn' type='button' data-copy='" + safeLookupUrl + "'>Copy Lookup URL</button>"
+                    "<p style='margin-top:0.9rem;font-size:0.9rem;color:#8f9feb;'>Bookmark the page or share it with your automation engineer.</p>"
+                    "</div>"
+                    "</div><script>document.querySelectorAll('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var value=btn.getAttribute('data-copy');navigator.clipboard.writeText(value).then(function(){var original=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=original;},1600);}).catch(function(){btn.textContent='Retry copy';setTimeout(function(){btn.textContent='Copy Lookup URL';},1600);});});});</script></body></html>");
   shouldRestart = true;
 }
 
 void startConfigPortal() {
   WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIp, apIp, apNetmask);
   String apSsid = "Beeper-" + deviceId.substring(deviceId.length() - 4);
   WiFi.softAP(apSsid.c_str(), "");
 
@@ -132,11 +309,46 @@ void startConfigPortal() {
   Serial.println(apSsid);
   Serial.println("Connect and browse to http://192.168.4.1");
 
+  dnsServer.start(dnsPort, "*", apIp);
+
   configServer.on("/", HTTP_GET, sendConfigForm);
   configServer.on("/", HTTP_POST, handleConfigSave);
+  configServer.on("/generate_204", HTTP_GET, sendPortalRedirect);
+  configServer.on("/hotspot-detect.html", HTTP_GET, sendPortalRedirect);
+  configServer.on("/fwlink", HTTP_GET, sendPortalRedirect);
+  configServer.onNotFound(sendConfigForm);
   configServer.begin();
 
   configMode = true;
+}
+
+void armConfigReset() {
+  if (configMode || resetTriggerArmed) {
+    return;
+  }
+
+  Serial.println("Config reset button triggered. Clearing Wi-Fi credentials and entering setup mode.");
+  clearStoredConfig();
+  WiFi.disconnect(true, true);
+  startConfigPortal();
+  resetTriggerArmed = true;
+}
+
+void checkResetButton() {
+  int buttonState = digitalRead(resetButtonPin);
+
+  if (buttonState == LOW) { // button pressed (assuming pull-up)
+    if (resetPressStart == 0) {
+      resetPressStart = millis();
+    } else if (millis() - resetPressStart >= 3000) {
+      armConfigReset();
+    }
+  } else {
+    resetPressStart = 0;
+    if (!configMode) {
+      resetTriggerArmed = false;
+    }
+  }
 }
 
 bool claimDevice() {
@@ -159,17 +371,36 @@ bool claimDevice() {
     Serial.println("Claim response:");
     Serial.println(response);
 
+    String extractedPollSecret = "";
     int startIdx = response.indexOf("\"poll_secret\":\"");
     if (startIdx >= 0) {
       startIdx += 15;
       int endIdx = response.indexOf("\"", startIdx);
       if (endIdx > startIdx) {
-        String secret = response.substring(startIdx, endIdx);
-        savePollSecret(secret);
-        http.end();
-        Serial.println("Poll secret stored.");
-        return true;
+        extractedPollSecret = response.substring(startIdx, endIdx);
       }
+    }
+
+    String extractedWebhook = "";
+    startIdx = response.indexOf("\"webhook_url\":\"");
+    if (startIdx >= 0) {
+      startIdx += 15;
+      int endIdx = response.indexOf("\"", startIdx);
+      if (endIdx > startIdx) {
+        extractedWebhook = response.substring(startIdx, endIdx);
+        extractedWebhook.replace("\\/", "/");
+      }
+    }
+
+    if (!extractedPollSecret.isEmpty()) {
+      saveClaimData(extractedPollSecret, extractedWebhook);
+      http.end();
+      Serial.println("Poll secret stored.");
+      if (!extractedWebhook.isEmpty()) {
+        Serial.print("Webhook URL: ");
+        Serial.println(extractedWebhook);
+      }
+      return true;
     }
 
     Serial.println("Claim response missing poll_secret.");
@@ -178,6 +409,14 @@ bool claimDevice() {
     Serial.println(httpCode);
     if (http.getSize() > 0) {
       Serial.println(http.getString());
+    }
+    if (httpCode == 401 || httpCode == 404) {
+      Serial.println("Claim rejected. Clearing stored claim code and entering setup mode.");
+      prefs.remove("claim_code");
+      claimCode = "";
+      if (!configMode) {
+        startConfigPortal();
+      }
     }
   }
 
@@ -210,17 +449,7 @@ void pollForTrigger() {
     Serial.println(payload);
     if (payload.indexOf("\"trigger\":true") >= 0) {
       Serial.println("Trigger detected. Beeping...");
-      digitalWrite(buzzerPin, HIGH);
-      delay(50);
-      digitalWrite(buzzerPin, LOW);
-      delay(50);
-      digitalWrite(buzzerPin, HIGH);
-      delay(50);
-      digitalWrite(buzzerPin, LOW);
-      delay(50);
-      digitalWrite(buzzerPin, HIGH);
-      delay(500);
-      digitalWrite(buzzerPin, LOW);
+      beepPattern();
     }
   } else {
     Serial.print("HTTP poll error: ");
@@ -230,24 +459,25 @@ void pollForTrigger() {
   http.end();
 }
 
-// happy rhythmic pattern – kept for future reuse
 void beepPattern() {
-  int pattern[][2] = {
-    {100, 100}, {100, 50}, {100, 150},
-    {200, 80}, {200, 80}, {300, 100},
-    {100, 50}, {100, 50}, {400, 120},
-    {600, 300}
+  const int pattern[][2] = {
+    {120, 80},  {120, 80},  {120, 160},  // opening triple beep
+    {40, 60},   {40, 60},   {40, 200},   // quick chirps
+    {300, 70},  {300, 70},               // two strong pulses
+    {600, 400}                           // lingering finish
   };
 
-  int patternLength = sizeof(pattern) / sizeof(pattern[0]);
-  unsigned long start = millis();
+  const int patternLength = sizeof(pattern) / sizeof(pattern[0]);
 
-  while (millis() - start < 5000) {
+  for (int cycle = 0; cycle < 3; cycle++) {
     for (int i = 0; i < patternLength; i++) {
       digitalWrite(buzzerPin, HIGH);
       delay(pattern[i][0]);
       digitalWrite(buzzerPin, LOW);
       delay(pattern[i][1]);
+    }
+    if (cycle < 2) {
+      delay(300); // short pause before repeating
     }
   }
 }
@@ -256,6 +486,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
+  pinMode(resetButtonPin, INPUT_PULLUP);
 
   prefs.begin("beeper", false);
 
@@ -268,11 +499,23 @@ void setup() {
 
   if (!connectToWiFi()) {
     startConfigPortal();
+    return;
+  }
+
+  if (pollSecret.isEmpty()) {
+    if (!claimCode.isEmpty()) {
+      claimDevice();
+    } else {
+      Serial.println("Device has Wi-Fi but no claim info; waiting for setup.");
+    }
   }
 }
 
 void loop() {
+  checkResetButton();
+
   if (configMode) {
+    dnsServer.processNextRequest();
     configServer.handleClient();
 
     if (shouldRestart) {
@@ -285,8 +528,10 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi disconnected. Attempting reconnect...");
     if (!connectToWiFi()) {
-      startConfigPortal();
-      return;
+      if (!configMode) {
+        startConfigPortal();
+      }
+    return;
     }
   }
 
