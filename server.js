@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const deviceStore = require('./deviceStore');
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_SECRET = process.env.WEBHOOK_SECRET || 'replace_with_admin_secret';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'Lacubra534';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 
 const app = express();
@@ -71,6 +71,17 @@ app.get('/link', async (req, res) => {
   if (claim) {
     try {
       match = await findDeviceByClaimCode(claim, device);
+      // Auto-backfill URLs if device exists but URLs are missing
+      if (match && match.record && (!match.record.webhookUrl || !match.record.claimLookupUrl)) {
+        try {
+          await deviceStore.updateUrls(match.id, baseUrl);
+          // Re-fetch to get updated URLs
+          match = await findDeviceByClaimCode(claim, device);
+        } catch (backfillError) {
+          console.warn('Failed to backfill URLs for device:', match.id, backfillError);
+          // Continue anyway - URLs will be generated on the fly
+        }
+      }
     } catch (error) {
       console.error('claim lookup failed', error);
       lookupError = 'Unexpected error fetching device details. Please try again.';
@@ -79,10 +90,10 @@ app.get('/link', async (req, res) => {
 
   let bodyContent = `
     <section class="card hero">
-      <h1>Beeper Claim Lookup</h1>
+      <h1>Beeper Device Setup</h1>
       <p class="lead">
-        Enter your device claim code to fetch the webhook URL, poll secret, and a ready-to-use curl command.
-        These details appear once your device has successfully joined Wi-Fi and registered with the cloud.
+        Enter your device claim code to get your trigger URL and access key.
+        These details appear once your device has successfully connected to Wi-Fi and registered.
       </p>
       <form class="lookup-form" method="GET">
         <label>Claim Code
@@ -120,32 +131,42 @@ app.get('/link', async (req, res) => {
         </section>
       `;
     } else {
-      const webhookUrl = `${baseUrl}/api/device/webhook/${match.id}/${match.record.webhookSecret}`;
+      const webhookUrl = `${baseUrl}/api/device/webhook/${match.id}`;
+      const webhookSecret = match.record.webhookSecret;
       const pollSecret = match.record.pollSecret;
-      const curlCommand = `curl -X POST "${webhookUrl}" -H 'Content-Type: application/json' -d '{"trigger":true}'`;
+      const curlCommand = `curl -X POST "${webhookUrl}" -H 'Content-Type: application/json' -H 'x-webhook-secret: ${escapeHtml(webhookSecret)}' -d '{"trigger":true}'`;
 
       bodyContent += `
         <section class="card success">
-          <h2>Integration Ready</h2>
-          <p class="subtitle">Device <strong>${escapeHtml(match.id)}</strong> is paired. Copy the values below into your automation workflow.</p>
+          <h2>Device Ready</h2>
+          <p class="subtitle">Device <strong>${escapeHtml(match.id)}</strong> is connected and ready to use. Copy the values below into your automation or app.</p>
           <div class="info-block">
-            <div class="info-header">Webhook URL</div>
+            <div class="info-header">Trigger URL</div>
+            <p class="info-description">Use this URL to make your device beep. Keep this URL private.</p>
             <code id="webhook-url">${escapeHtml(webhookUrl)}</code>
-            <button class="copy" data-copy="${escapeHtml(webhookUrl)}">Copy Webhook URL</button>
+            <button class="copy" data-copy="${escapeHtml(webhookUrl)}">Copy Trigger URL</button>
           </div>
           <div class="info-block">
-            <div class="info-header">Poll Secret</div>
+            <div class="info-header">Webhook Secret</div>
+            <p class="info-description">Include this secret in the x-webhook-secret header when calling the trigger URL. Keep this secret private.</p>
+            <code id="webhook-secret">${escapeHtml(webhookSecret)}</code>
+            <button class="copy" data-copy="${escapeHtml(webhookSecret)}">Copy Webhook Secret</button>
+          </div>
+          <div class="info-block">
+            <div class="info-header">Device Access Key</div>
+            <p class="info-description">Used by the device to check for triggers. You typically don't need this unless building custom integrations.</p>
             <code id="poll-secret">${escapeHtml(pollSecret)}</code>
-            <button class="copy" data-copy="${escapeHtml(pollSecret)}">Copy Poll Secret</button>
+            <button class="copy" data-copy="${escapeHtml(pollSecret)}">Copy Access Key</button>
           </div>
           <div class="info-block">
-            <div class="info-header">curl Command</div>
+            <div class="info-header">cURL Command</div>
+            <p class="info-description">Run this command in your terminal to test the device. The webhook secret is included in the header for security.</p>
             <code id="curl-command">${escapeHtml(curlCommand)}</code>
-            <button class="copy primary" data-copy="${escapeHtml(curlCommand)}">Copy curl Command</button>
+            <button class="copy primary" data-copy="${escapeHtml(curlCommand)}">Copy cURL Command</button>
           </div>
           <div class="info-block">
-            <button class="test-webhook" data-webhook-url="${escapeHtml(webhookUrl)}">
-              <span class="test-webhook-text">Test Webhook Trigger</span>
+            <button class="test-webhook" data-webhook-url="${escapeHtml(webhookUrl)}" data-webhook-secret="${escapeHtml(webhookSecret)}">
+              <span class="test-webhook-text">Test Device</span>
               <span class="test-webhook-spinner" style="display: none;">⏳</span>
             </button>
             <div class="test-webhook-feedback" style="display: none;"></div>
@@ -161,7 +182,7 @@ app.get('/link', async (req, res) => {
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Beeper Link Portal</title>
+        <title>Beeper Device Setup</title>
         <style>
           :root {
             color-scheme: light dark;
@@ -278,6 +299,13 @@ app.get('/link', async (req, res) => {
             letter-spacing: 0.08em;
             font-size: 0.85rem;
             color: rgba(255, 255, 255, 0.75);
+            margin-bottom: 0.4rem;
+          }
+          .info-description {
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.6);
+            margin: 0 0 0.6rem 0;
+            line-height: 1.4;
           }
           code {
             display: block;
@@ -406,7 +434,8 @@ app.get('/link', async (req, res) => {
           document.querySelectorAll('.test-webhook').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var webhookUrl = btn.getAttribute('data-webhook-url');
-              if (!webhookUrl) { return; }
+              var webhookSecret = btn.getAttribute('data-webhook-secret');
+              if (!webhookUrl || !webhookSecret) { return; }
 
               var textSpan = btn.querySelector('.test-webhook-text');
               var spinnerSpan = btn.querySelector('.test-webhook-spinner');
@@ -418,12 +447,12 @@ app.get('/link', async (req, res) => {
               spinnerSpan.style.display = 'inline-block';
               feedbackDiv.style.display = 'none';
 
-              // Make the webhook request
+              // Make the webhook request with secret in header for security
               fetch(webhookUrl, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  'x-admin-secret': '${ADMIN_SECRET}'
+                  'x-webhook-secret': webhookSecret
                 },
                 body: JSON.stringify({ trigger: true })
               })
@@ -435,7 +464,7 @@ app.get('/link', async (req, res) => {
               .then(function(result) {
                 // Reset button
                 btn.disabled = false;
-                textSpan.textContent = 'Test Webhook Trigger';
+                textSpan.textContent = 'Test Device';
                 spinnerSpan.style.display = 'none';
 
                 // Show feedback
@@ -451,7 +480,7 @@ app.get('/link', async (req, res) => {
               .catch(function(error) {
                 // Reset button
                 btn.disabled = false;
-                textSpan.textContent = 'Test Webhook Trigger';
+                textSpan.textContent = 'Test Device';
                 spinnerSpan.style.display = 'none';
 
                 // Show error feedback
@@ -528,17 +557,25 @@ app.post('/api/device/claim', async (req, res) => {
 
     const pollSecret = generateSecret();
     const webhookSecret = record.webhookSecret || generateSecret();
-    await deviceStore.setSecrets(normalizedDeviceId, { pollSecret, webhookSecret });
+    
+    const baseUrl = resolveBaseUrl(req);
+    const webhookUrl = `${baseUrl}/api/device/webhook/${normalizedDeviceId}`;
+    const claimLookupUrl = `${baseUrl}/link?claim=${normalizedClaimCode}`;
+    
+    await deviceStore.setSecrets(normalizedDeviceId, { 
+      pollSecret, 
+      webhookSecret, 
+      webhookUrl, 
+      claimLookupUrl 
+    });
 
     console.log(`[CLAIM] Device ${normalizedDeviceId} claimed successfully. Poll secret: ${pollSecret.substring(0, 8)}...`);
-
-    const baseUrl = resolveBaseUrl(req);
-    const webhookUrl = `${baseUrl}/api/device/webhook/${normalizedDeviceId}/${webhookSecret}`;
 
     return res.json({
       ok: true,
       poll_secret: pollSecret,
       webhook_url: webhookUrl,
+      webhook_secret: webhookSecret,
     });
   } catch (error) {
     console.error('device claim failed', error);
@@ -548,11 +585,16 @@ app.post('/api/device/claim', async (req, res) => {
 
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
- * Authentication is provided via the webhook secret in the URL path.
+ * Authentication is provided via the x-webhook-secret header.
  */
-app.post('/api/device/webhook/:deviceId/:webhookSecret', async (req, res) => {
-  const { deviceId, webhookSecret } = req.params;
+app.post('/api/device/webhook/:deviceId', async (req, res) => {
+  const { deviceId } = req.params;
+  const webhookSecret = req.headers['x-webhook-secret'];
   const normalizedDeviceId = normalizeDeviceId(deviceId);
+
+  if (!webhookSecret) {
+    return res.status(401).json({ ok: false, msg: 'x-webhook-secret header required' });
+  }
 
   try {
     const record = await deviceStore.getByDeviceId(normalizedDeviceId);
@@ -560,7 +602,11 @@ app.post('/api/device/webhook/:deviceId/:webhookSecret', async (req, res) => {
       return res.status(404).json({ ok: false, msg: 'unknown webhook' });
     }
 
+    // Set the trigger flag for device polling
     await deviceStore.setTrigger(normalizedDeviceId, true);
+    // Create a trigger record in the triggers table for tracking
+    await deviceStore.createTrigger(normalizedDeviceId);
+    
     return res.json({ ok: true });
   } catch (error) {
     console.error('webhook trigger failed', error);
@@ -610,6 +656,381 @@ app.get('/api/device/status', async (req, res) => {
   } catch (error) {
     console.error('status poll failed', error);
     return res.status(500).json({ ok: false, msg: 'failed to fetch device status' });
+  }
+});
+
+/**
+ * Admin UI - Device Provisioning Interface
+ */
+app.get('/admin', async (req, res) => {
+  const adminSecret = req.query.secret || req.headers['x-admin-secret'] || '';
+  const isAuthenticated = adminSecret === ADMIN_SECRET;
+
+  let devices = [];
+  let provisionError = null;
+  let provisionSuccess = null;
+
+  if (isAuthenticated) {
+    try {
+      devices = await deviceStore.listAll(50);
+    } catch (error) {
+      console.error('Failed to list devices', error);
+    }
+  }
+
+  const page = `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Beeper Admin - Device Provisioning</title>
+        <style>
+          :root {
+            color-scheme: light dark;
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #0d1226, #101c38);
+            color: #e6ebff;
+          }
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 3rem 1.5rem 4rem;
+          }
+          .container {
+            width: 100%;
+            max-width: 1000px;
+            display: grid;
+            gap: 2rem;
+          }
+          .card {
+            background: rgba(18, 26, 54, 0.9);
+            border-radius: 1.25rem;
+            padding: 2.5rem 3rem;
+            box-shadow: 0 35px 60px rgba(8, 9, 23, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+          }
+          h1, h2 {
+            margin: 0 0 1rem;
+            color: #f8fbff;
+          }
+          .lead {
+            margin-bottom: 2rem;
+            color: #b6c4ff;
+            line-height: 1.6;
+          }
+          form {
+            display: grid;
+            gap: 1.5rem;
+          }
+          label {
+            font-weight: 600;
+            color: #dbe4ff;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+          }
+          input {
+            background: rgba(15, 22, 49, 0.92);
+            border: 1px solid rgba(102, 139, 255, 0.4);
+            color: #f4f7ff;
+            padding: 0.85rem 1rem;
+            border-radius: 0.85rem;
+            font-size: 1rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
+          }
+          input:focus {
+            outline: none;
+            border-color: #6f8dff;
+            box-shadow: 0 0 0 4px rgba(111, 141, 255, 0.2);
+          }
+          button {
+            padding: 1rem 1.4rem;
+            border-radius: 1rem;
+            border: none;
+            font-weight: 700;
+            font-size: 1.05rem;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+          }
+          button[type="submit"] {
+            background: linear-gradient(135deg, #5c7cfa, #4c6ef5);
+            color: white;
+            box-shadow: 0 22px 40px rgba(79, 109, 245, 0.35);
+          }
+          button[type="submit"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 28px 46px rgba(79, 109, 245, 0.45);
+          }
+          .btn-secondary {
+            background: rgba(255, 255, 255, 0.14);
+            color: #fff;
+          }
+          .btn-secondary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 18px 30px rgba(0, 0, 0, 0.35);
+          }
+          .status {
+            padding: 1.5rem 2rem;
+            border-radius: 0.85rem;
+            margin-bottom: 1.5rem;
+          }
+          .status.error {
+            border: 1px solid rgba(255, 107, 129, 0.45);
+            background: rgba(255, 82, 82, 0.12);
+            color: #ff6b81;
+          }
+          .status.success {
+            border: 1px solid rgba(88, 204, 130, 0.4);
+            background: rgba(46, 204, 113, 0.12);
+            color: #2ecc71;
+          }
+          .devices-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1.5rem;
+          }
+          .devices-table th,
+          .devices-table td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+          }
+          .devices-table th {
+            color: #b6c4ff;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+          }
+          .devices-table td {
+            color: #e6ebff;
+            font-size: 0.95rem;
+          }
+          .devices-table tr:hover {
+            background: rgba(255, 255, 255, 0.03);
+          }
+          .badge {
+            display: inline-block;
+            padding: 0.3rem 0.7rem;
+            border-radius: 0.5rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+          }
+          .badge.claimed {
+            background: rgba(46, 204, 113, 0.2);
+            color: #2ecc71;
+            border: 1px solid rgba(46, 204, 113, 0.4);
+          }
+          .badge.unclaimed {
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+            border: 1px solid rgba(255, 193, 7, 0.4);
+          }
+          .generate-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 0.5rem 1rem;
+            border-radius: 0.6rem;
+            font-size: 0.9rem;
+            cursor: pointer;
+            margin-left: 0.5rem;
+          }
+          .generate-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+          }
+          code {
+            font-family: 'SFMono-Regular', Menlo, ui-monospace, monospace;
+            background: rgba(12, 19, 42, 0.95);
+            padding: 0.2rem 0.5rem;
+            border-radius: 0.4rem;
+            font-size: 0.9rem;
+          }
+          @media (max-width: 640px) {
+            body {
+              padding: 2rem 1rem 3rem;
+            }
+            .card {
+              padding: 2rem 1.5rem;
+            }
+            .devices-table {
+              font-size: 0.85rem;
+            }
+            .devices-table th,
+            .devices-table td {
+              padding: 0.75rem 0.5rem;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <section class="card">
+            <h1>Beeper Admin Portal</h1>
+            <p class="lead">Provision and manage Beeper devices</p>
+            
+            ${!isAuthenticated ? `
+              <form method="GET" action="/admin">
+                <label>
+                  Admin Secret
+                  <input name="secret" type="password" placeholder="Enter admin secret" required />
+                </label>
+                <button type="submit">Authenticate</button>
+              </form>
+            ` : `
+              <div style="margin-bottom: 2rem;">
+                <a href="/admin" style="color: #b6c4ff; text-decoration: none;">← Back to login</a>
+              </div>
+              
+              <h2>Provision New Device</h2>
+              <form id="provision-form" method="POST" action="/api/admin/provision">
+                <input type="hidden" name="admin_secret" value="${ADMIN_SECRET}" />
+                <label>
+                  Device ID
+                  <input name="device_id" id="device_id" placeholder="e.g. AABBCCDDEEFF (MAC address)" required />
+                  <small style="color: #8a9bb8; font-size: 0.85rem; margin-top: 0.3rem;">
+                    Usually the device's MAC address in uppercase hex format
+                  </small>
+                </label>
+                <label>
+                  Claim Code
+                  <div style="display: flex; gap: 0.5rem; align-items: flex-start;">
+                    <input name="claim_code" id="claim_code" placeholder="e.g. 4G7X9A" required style="flex: 1;" />
+                    <button type="button" class="generate-btn" onclick="generateClaimCode()">Generate</button>
+                  </div>
+                  <small style="color: #8a9bb8; font-size: 0.85rem; margin-top: 0.3rem;">
+                    Human-readable code that users will enter during device setup
+                  </small>
+                </label>
+                <button type="submit">Provision Device</button>
+              </form>
+              
+              <div id="provision-feedback"></div>
+              
+              <h2 style="margin-top: 3rem;">Existing Devices (${devices.length})</h2>
+              ${devices.length === 0 ? `
+                <p style="color: #8a9bb8;">No devices provisioned yet.</p>
+              ` : `
+                <table class="devices-table">
+                  <thead>
+                    <tr>
+                      <th>Device ID</th>
+                      <th>Claim Code</th>
+                      <th>Status</th>
+                      <th>Webhook URL</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${devices.map(device => `
+                      <tr>
+                        <td><code>${escapeHtml(device.deviceId)}</code></td>
+                        <td><code>${escapeHtml(device.claimCode)}</code></td>
+                        <td>
+                          <span class="badge ${device.pollSecret ? 'claimed' : 'unclaimed'}">
+                            ${device.pollSecret ? 'Claimed' : 'Unclaimed'}
+                          </span>
+                        </td>
+                        <td>
+                          ${device.webhookSecret ? `
+                            <a href="${resolveBaseUrl(req)}/link?claim=${escapeHtml(device.claimCode)}" 
+                               style="color: #6f8dff; text-decoration: none; font-size: 0.9rem;">
+                              View Credentials
+                            </a>
+                          ` : '<span style="color: #8a9bb8;">Not available</span>'}
+                        </td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              `}
+            `}
+          </section>
+        </div>
+        <script>
+          function generateClaimCode() {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+            let code = '';
+            for (let i = 0; i < 6; i++) {
+              code += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            document.getElementById('claim_code').value = code;
+          }
+          
+          ${isAuthenticated ? `
+          document.getElementById('provision-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            const feedback = document.getElementById('provision-feedback');
+            feedback.innerHTML = '<div class="status" style="margin-top: 1rem;">⏳ Provisioning...</div>';
+            
+            try {
+              const response = await fetch('/api/admin/provision', {
+                method: 'POST',
+                headers: {
+                  'x-admin-secret': formData.get('admin_secret'),
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  device_id: formData.get('device_id'),
+                  claim_code: formData.get('claim_code')
+                })
+              });
+              
+              const result = await response.json();
+              
+              if (result.ok) {
+                feedback.innerHTML = '<div class="status success">✓ Device provisioned successfully! Refresh to see it in the list.</div>';
+                this.reset();
+                setTimeout(() => location.reload(), 1500);
+              } else {
+                feedback.innerHTML = '<div class="status error">✗ ' + (result.msg || 'Provisioning failed') + '</div>';
+              }
+            } catch (error) {
+              feedback.innerHTML = '<div class="status error">✗ Network error: ' + error.message + '</div>';
+            }
+          });
+          ` : ''}
+        </script>
+      </body>
+    </html>
+  `;
+
+  res.type('html').send(page);
+});
+
+/**
+ * API endpoint to list all devices (for admin UI)
+ */
+app.get('/api/admin/devices', requireAdmin, async (req, res) => {
+  try {
+    const devices = await deviceStore.listAll(100);
+    return res.json({ ok: true, devices });
+  } catch (error) {
+    console.error('Failed to list devices', error);
+    return res.status(500).json({ ok: false, msg: 'failed to list devices' });
+  }
+});
+
+/**
+ * Admin endpoint to backfill webhook_url and claim_lookup_url for existing devices
+ */
+app.post('/api/admin/backfill-urls', requireAdmin, async (req, res) => {
+  try {
+    const baseUrl = resolveBaseUrl(req);
+    const result = await deviceStore.backfillUrls(baseUrl);
+    return res.json({ 
+      ok: true, 
+      updated: result.updated, 
+      total: result.total,
+      errors: result.errors 
+    });
+  } catch (error) {
+    console.error('Backfill URLs failed', error);
+    return res.status(500).json({ ok: false, msg: 'failed to backfill URLs' });
   }
 });
 
