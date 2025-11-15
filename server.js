@@ -2,6 +2,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+const deviceStore = require('./deviceStore');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.WEBHOOK_SECRET || 'replace_with_admin_secret';
@@ -9,18 +10,6 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 
 const app = express();
 app.use(bodyParser.json());
-
-/**
- * In-memory device store
- * Structure:
- * {
- *   claimCode: string,
- *   pollSecret: string | null,
- *   webhookSecret: string | null,
- *   trigger: boolean
- * }
- */
-const devices = new Map();
 
 const generateSecret = () => crypto.randomBytes(16).toString('hex');
 
@@ -42,6 +31,9 @@ const requireAdmin = (req, res, next) => {
 
 app.get('/', (_req, res) => res.send('relay ok'));
 
+const normalizeClaimCode = (value = '') => String(value).trim().toUpperCase();
+const normalizeDeviceId = (value = '') => String(value).trim().toUpperCase();
+
 const resolveBaseUrl = (req) => {
   if (PUBLIC_BASE_URL) {
     return PUBLIC_BASE_URL.replace(/\/$/, '');
@@ -54,28 +46,36 @@ const resolveBaseUrl = (req) => {
   return `${protocol}://${host}`.replace(/\/$/, '');
 };
 
-const findDeviceByClaimCode = (claimCode, deviceId) => {
-  const normalizedClaim = (claimCode || '').trim().toUpperCase();
-  const normalizedDevice = (deviceId || '').trim().toUpperCase();
+const findDeviceByClaimCode = async (claimCode, deviceId) => {
+  const normalizedClaim = normalizeClaimCode(claimCode);
+  const normalizedDevice = deviceId ? normalizeDeviceId(deviceId) : null;
+
   if (!normalizedClaim) {
     return null;
   }
 
-  for (const [id, record] of devices.entries()) {
-    if (!record.claimCode) continue;
-    const recordClaim = String(record.claimCode).trim().toUpperCase();
-    if (recordClaim !== normalizedClaim) continue;
-    if (normalizedDevice && String(id).trim().toUpperCase() !== normalizedDevice) continue;
-    return { id, record };
+  const record = await deviceStore.findByClaimCode(normalizedClaim, normalizedDevice || undefined);
+  if (!record) {
+    return null;
   }
 
-  return null;
+  return { id: record.deviceId, record };
 };
 
-app.get('/link', (req, res) => {
+app.get('/link', async (req, res) => {
   const baseUrl = resolveBaseUrl(req);
   const { claim, device } = req.query || {};
-  const match = claim ? findDeviceByClaimCode(claim, device) : null;
+  let match = null;
+  let lookupError = null;
+
+  if (claim) {
+    try {
+      match = await findDeviceByClaimCode(claim, device);
+    } catch (error) {
+      console.error('claim lookup failed', error);
+      lookupError = 'Unexpected error fetching device details. Please try again.';
+    }
+  }
 
   let bodyContent = `
     <section class="card hero">
@@ -97,7 +97,14 @@ app.get('/link', (req, res) => {
   `;
 
   if (claim) {
-    if (!match) {
+    if (lookupError) {
+      bodyContent += `
+        <section class="card status error">
+          <h2>Lookup failed</h2>
+          <p>${escapeHtml(lookupError)}</p>
+        </section>
+      `;
+    } else if (!match) {
       bodyContent += `
         <section class="card status error">
           <h2>No device found</h2>
@@ -351,20 +358,22 @@ app.get('/link', (req, res) => {
  * Admin endpoint to provision a device with an initial claim code.
  * Body: { device_id, claim_code }
  */
-app.post('/api/admin/provision', requireAdmin, (req, res) => {
+app.post('/api/admin/provision', requireAdmin, async (req, res) => {
   const { device_id: deviceId, claim_code: claimCode } = req.body || {};
   if (!deviceId || !claimCode) {
     return res.status(400).json({ ok: false, msg: 'device_id and claim_code required' });
   }
 
-  devices.set(deviceId, {
-    claimCode,
-    pollSecret: null,
-    webhookSecret: null,
-    trigger: false,
-  });
+  const normalizedDeviceId = normalizeDeviceId(deviceId);
+  const normalizedClaimCode = normalizeClaimCode(claimCode);
 
-  return res.json({ ok: true });
+  try {
+    await deviceStore.provision(normalizedDeviceId, normalizedClaimCode);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('provision failed', error);
+    return res.status(500).json({ ok: false, msg: 'failed to provision device' });
+  }
 });
 
 /**
@@ -372,48 +381,62 @@ app.post('/api/admin/provision', requireAdmin, (req, res) => {
  * Body: { device_id, claim_code }
  * Returns: { poll_secret, webhook_url }
  */
-app.post('/api/device/claim', (req, res) => {
+app.post('/api/device/claim', async (req, res) => {
   const { device_id: deviceId, claim_code: claimCode } = req.body || {};
   if (!deviceId || !claimCode) {
     return res.status(400).json({ ok: false, msg: 'device_id and claim_code required' });
   }
 
-  const record = devices.get(deviceId);
-  if (!record) {
-    return res.status(404).json({ ok: false, msg: 'device not provisioned' });
+  const normalizedDeviceId = normalizeDeviceId(deviceId);
+  const normalizedClaimCode = normalizeClaimCode(claimCode);
+
+  try {
+    const record = await deviceStore.getByDeviceId(normalizedDeviceId);
+    if (!record) {
+      return res.status(404).json({ ok: false, msg: 'device not provisioned' });
+    }
+
+    if (record.claimCode !== normalizedClaimCode) {
+      return res.status(401).json({ ok: false, msg: 'invalid claim code' });
+    }
+
+    const pollSecret = generateSecret();
+    const webhookSecret = record.webhookSecret || generateSecret();
+    await deviceStore.setSecrets(normalizedDeviceId, { pollSecret, webhookSecret });
+
+    const baseUrl = resolveBaseUrl(req);
+    const webhookUrl = `${baseUrl}/api/device/webhook/${normalizedDeviceId}/${webhookSecret}`;
+
+    return res.json({
+      ok: true,
+      poll_secret: pollSecret,
+      webhook_url: webhookUrl,
+    });
+  } catch (error) {
+    console.error('device claim failed', error);
+    return res.status(500).json({ ok: false, msg: 'failed to complete claim' });
   }
-
-  if (record.claimCode !== claimCode) {
-    return res.status(401).json({ ok: false, msg: 'invalid claim code' });
-  }
-
-  record.pollSecret = generateSecret();
-  record.webhookSecret = record.webhookSecret || generateSecret();
-  record.trigger = false;
-
-  const baseUrl = resolveBaseUrl(req);
-  const webhookUrl = `${baseUrl}/api/device/webhook/${deviceId}/${record.webhookSecret}`;
-
-  return res.json({
-    ok: true,
-    poll_secret: record.pollSecret,
-    webhook_url: webhookUrl,
-  });
 });
 
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
  */
-app.post('/api/device/webhook/:deviceId/:webhookSecret', (req, res) => {
+app.post('/api/device/webhook/:deviceId/:webhookSecret', requireAdmin, async (req, res) => {
   const { deviceId, webhookSecret } = req.params;
-  const record = devices.get(deviceId);
+  const normalizedDeviceId = normalizeDeviceId(deviceId);
 
-  if (!record || record.webhookSecret !== webhookSecret) {
-    return res.status(404).json({ ok: false, msg: 'unknown webhook' });
+  try {
+    const record = await deviceStore.getByDeviceId(normalizedDeviceId);
+    if (!record || record.webhookSecret !== webhookSecret) {
+      return res.status(404).json({ ok: false, msg: 'unknown webhook' });
+    }
+
+    await deviceStore.setTrigger(normalizedDeviceId, true);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('webhook trigger failed', error);
+    return res.status(500).json({ ok: false, msg: 'failed to queue trigger' });
   }
-
-  record.trigger = true;
-  return res.json({ ok: true });
 });
 
 /**
@@ -421,7 +444,7 @@ app.post('/api/device/webhook/:deviceId/:webhookSecret', (req, res) => {
  * Query: device_id
  * Headers: x-poll-secret
  */
-app.get('/api/device/status', (req, res) => {
+app.get('/api/device/status', async (req, res) => {
   const deviceId = req.query.device_id;
   const pollSecret = req.headers['x-poll-secret'];
 
@@ -429,15 +452,24 @@ app.get('/api/device/status', (req, res) => {
     return res.status(400).json({ ok: false, msg: 'device_id and x-poll-secret required' });
   }
 
-  const record = devices.get(deviceId);
-  if (!record || record.pollSecret !== pollSecret) {
-    return res.status(401).json({ ok: false, msg: 'unauthorized' });
+  const normalizedDeviceId = normalizeDeviceId(deviceId);
+
+  try {
+    const record = await deviceStore.getByDeviceId(normalizedDeviceId);
+    if (!record || record.pollSecret !== pollSecret) {
+      return res.status(401).json({ ok: false, msg: 'unauthorized' });
+    }
+
+    const shouldTrigger = record.trigger;
+    if (shouldTrigger) {
+      await deviceStore.setTrigger(normalizedDeviceId, false);
+    }
+
+    return res.json({ ok: true, trigger: shouldTrigger });
+  } catch (error) {
+    console.error('status poll failed', error);
+    return res.status(500).json({ ok: false, msg: 'failed to fetch device status' });
   }
-
-  const shouldTrigger = record.trigger;
-  record.trigger = false;
-
-  return res.json({ ok: true, trigger: shouldTrigger });
 });
 
 app.listen(PORT, () => {
