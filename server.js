@@ -664,34 +664,28 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
       
       // Get raw body for signature verification
       const rawBody = req.rawBody ? req.rawBody.toString() : JSON.stringify(req.body);
-      const timestamp = req.headers['x-webhook-timestamp'] || req.headers['X-Webhook-Timestamp'] || '';
       
-      // Framer uses: HMAC-SHA256(rawBody, secret)
-      // Some implementations use timestamp + body, let's try both
-      let expectedSignature = crypto
-        .createHmac('sha256', record.webhookSecret)
-        .update(rawBody)
-        .digest('hex')
-        .toLowerCase();
+      // Get submission ID (required for Framer signature verification)
+      const submissionId = req.headers['framer-webhook-submission-id'] || req.headers['Framer-Webhook-Submission-Id'] || '';
       
-      let signatureMatches = receivedSig === expectedSignature;
-      
-      // Try with timestamp if signature doesn't match and timestamp is provided
-      if (!signatureMatches && timestamp) {
-        const payloadToSign = `${timestamp}${rawBody}`;
-        expectedSignature = crypto
-          .createHmac('sha256', record.webhookSecret)
-          .update(payloadToSign)
-          .digest('hex')
-          .toLowerCase();
-        signatureMatches = receivedSig === expectedSignature;
+      // According to Framer docs: HMAC-SHA256(payload + submissionId, secret)
+      // The signature is computed as: hmac.update(payload).update(submissionId).digest('hex')
+      // Reference: https://www.framer.com/help/articles/framer-form-webhook-setup/
+      const hmac = crypto.createHmac('sha256', record.webhookSecret);
+      hmac.update(rawBody);
+      if (submissionId) {
+        hmac.update(submissionId);
       }
+      const expectedSignature = hmac.digest('hex').toLowerCase();
+      
+      const signatureMatches = receivedSig === expectedSignature;
       
       if (!signatureMatches) {
         console.log(`[WEBHOOK] Signature mismatch for device ${normalizedDeviceId}`);
         console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
         console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSignature.substring(0, 16)}...`);
-        console.log(`[WEBHOOK] Raw body length: ${rawBody.length}, Timestamp: ${timestamp || 'none'}`);
+        console.log(`[WEBHOOK] Raw body length: ${rawBody.length}`);
+        console.log(`[WEBHOOK] Submission ID: ${submissionId || 'none'}`);
         console.log(`[WEBHOOK] Raw body preview: ${rawBody.substring(0, 100)}...`);
         return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
       }
