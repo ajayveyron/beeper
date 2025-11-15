@@ -141,32 +141,32 @@ app.get('/link', async (req, res) => {
           <h2>Device Ready</h2>
           <p class="subtitle">Device <strong>${escapeHtml(match.id)}</strong> is connected and ready to use. Copy the values below into your automation or app.</p>
           <div class="info-block">
-            <div class="info-header">Trigger URL</div>
-            <p class="info-description">Use this URL to make your device beep. Keep this URL private.</p>
+            <div class="info-header">WEBHOOK URL</div>
+            <p class="info-description">Use this URL to make your device beep. Keep this URL private. The secret must be provided in the x-webhook-secret header, not in the URL.</p>
             <code id="webhook-url">${escapeHtml(webhookUrl)}</code>
-            <button class="copy" data-copy="${escapeHtml(webhookUrl)}">Copy Trigger URL</button>
+            <button class="copy" data-copy="${escapeHtml(webhookUrl)}">Copy Webhook URL</button>
           </div>
           <div class="info-block">
-            <div class="info-header">Webhook Secret</div>
-            <p class="info-description">Include this secret in the x-webhook-secret header when calling the trigger URL. Keep this secret private.</p>
+            <div class="info-header">WEBHOOK SECRET</div>
+            <p class="info-description">Include this secret in the x-webhook-secret header when calling the webhook URL. Keep this secret private.</p>
             <code id="webhook-secret">${escapeHtml(webhookSecret)}</code>
             <button class="copy" data-copy="${escapeHtml(webhookSecret)}">Copy Webhook Secret</button>
           </div>
           <div class="info-block">
-            <div class="info-header">Device Access Key</div>
+            <div class="info-header">POLL SECRET</div>
             <p class="info-description">Used by the device to check for triggers. You typically don't need this unless building custom integrations.</p>
             <code id="poll-secret">${escapeHtml(pollSecret)}</code>
-            <button class="copy" data-copy="${escapeHtml(pollSecret)}">Copy Access Key</button>
+            <button class="copy" data-copy="${escapeHtml(pollSecret)}">Copy Poll Secret</button>
           </div>
           <div class="info-block">
-            <div class="info-header">cURL Command</div>
-            <p class="info-description">Run this command in your terminal to test the device. The webhook secret is included in the header for security.</p>
+            <div class="info-header">CURL COMMAND</div>
+            <p class="info-description">Run this command in your terminal to test the device. The webhook secret is included in the x-webhook-secret header for security.</p>
             <code id="curl-command">${escapeHtml(curlCommand)}</code>
-            <button class="copy primary" data-copy="${escapeHtml(curlCommand)}">Copy cURL Command</button>
+            <button class="copy primary" data-copy="${escapeHtml(curlCommand)}">Copy curl Command</button>
           </div>
           <div class="info-block">
             <button class="test-webhook" data-webhook-url="${escapeHtml(webhookUrl)}" data-webhook-secret="${escapeHtml(webhookSecret)}">
-              <span class="test-webhook-text">Test Device</span>
+              <span class="test-webhook-text">Test Webhook Trigger</span>
               <span class="test-webhook-spinner" style="display: none;">⏳</span>
             </button>
             <div class="test-webhook-feedback" style="display: none;"></div>
@@ -586,10 +586,13 @@ app.post('/api/device/claim', async (req, res) => {
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
  * Authentication is provided via multiple methods for compatibility:
- * 1. x-webhook-secret header (preferred)
+ * 1. x-webhook-secret header (preferred - most secure, secret not in URL)
  * 2. Authorization: Bearer <secret> header
- * 3. Query parameter: ?secret=<secret>
+ * 3. Query parameter: ?secret=<secret> (less secure, secret visible in logs)
  * 4. Request body: { "secret": "<secret>" }
+ * 
+ * NOTE: The secret should NEVER be in the URL path for security reasons.
+ * The URL format is: /api/device/webhook/:deviceId (deviceId only, no secret)
  */
 app.post('/api/device/webhook/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
