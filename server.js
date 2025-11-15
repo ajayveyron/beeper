@@ -390,13 +390,24 @@ app.post('/api/device/claim', async (req, res) => {
   const normalizedDeviceId = normalizeDeviceId(deviceId);
   const normalizedClaimCode = normalizeClaimCode(claimCode);
 
+  console.log(`[CLAIM] Attempting claim for device ${normalizedDeviceId} (original: ${deviceId}) with claim code ${normalizedClaimCode}`);
+
   try {
-    const record = await deviceStore.getByDeviceId(normalizedDeviceId);
+    let record = await deviceStore.getByDeviceId(normalizedDeviceId);
+    
+    // Auto-provision if device doesn't exist
     if (!record) {
-      return res.status(404).json({ ok: false, msg: 'device not provisioned' });
+      console.log(`[CLAIM] Device ${normalizedDeviceId} not found, auto-provisioning...`);
+      await deviceStore.provision(normalizedDeviceId, normalizedClaimCode);
+      record = await deviceStore.getByDeviceId(normalizedDeviceId);
+      if (!record) {
+        console.error(`[CLAIM] Failed to provision device ${normalizedDeviceId}`);
+        return res.status(500).json({ ok: false, msg: 'failed to provision device' });
+      }
     }
 
     if (record.claimCode !== normalizedClaimCode) {
+      console.error(`[CLAIM] Claim code mismatch for device ${normalizedDeviceId}: expected ${record.claimCode}, got ${normalizedClaimCode}`);
       return res.status(401).json({ ok: false, msg: 'invalid claim code' });
     }
 
@@ -462,6 +473,8 @@ app.get('/api/device/status', async (req, res) => {
       console.error(`[POLL] Device not found: ${normalizedDeviceId} (original: ${deviceId})`);
       return res.status(401).json({ ok: false, msg: 'unauthorized' });
     }
+    
+    console.log(`[POLL] Device ${normalizedDeviceId} found, checking poll secret...`);
     if (record.pollSecret !== pollSecret) {
       console.error(`[POLL] Secret mismatch for device ${normalizedDeviceId}:`, {
         received: pollSecret,

@@ -127,6 +127,8 @@ void sendConfigForm() {
   ssidValue.replace("'", "&#39;");
   String claimValue = claimCode;
   claimValue.replace("'", "&#39;");
+  claimValue
+      .toUpperCase(); // Convert to uppercase before using in concatenation
   String claimLookupBase = String(backendBaseUrl) + "/link";
   String claimLookupUrl = claimLookupBase;
   if (!claimCode.isEmpty()) {
@@ -236,7 +238,7 @@ void sendConfigForm() {
       "<label>Wi-Fi Password<input name='pass' type='text' "
       "placeholder='Password' required></label>"
       "<label>Claim Code<input name='claim' placeholder='e.g. 4G7X9A' value='" +
-      claimValue.toUpperCase() +
+      claimValue +
       "' required></label>"
       "<button class='submit-btn' type='submit'>Save & Reboot Device</button>"
       "</form>"
