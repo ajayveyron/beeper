@@ -41,6 +41,8 @@ unsigned long lastPoll = 0;
 unsigned long resetPressStart = 0;
 bool resetTriggerArmed = false;
 const unsigned long restartDelayMs = 30000; // 30 seconds delay before restart
+int consecutivePollErrors = 0;
+const int maxPollErrors = 5; // After 5 consecutive 401 errors, force re-claim
 
 // ---------- Helper ----------
 String sanitizedMac() {
@@ -77,8 +79,9 @@ void saveClaimData(const String &secret, const String &webhook) {
   webhookUrl = webhook;
   prefs.putString("poll_secret", secret);
   prefs.putString("webhook_url", webhook);
-  prefs.remove("claim_code"); // no longer needed after claim
-  claimCode = "";
+  // Keep claim_code stored so device can re-claim if needed (e.g., after DB
+  // migration) prefs.remove("claim_code"); // Removed - keep for potential
+  // re-claim
 }
 
 void clearStoredConfig() {
@@ -639,9 +642,39 @@ void pollForTrigger() {
       Serial.println("Trigger detected. Beeping...");
       beepPattern();
     }
+    consecutivePollErrors = 0; // Reset error counter on success
+  } else if (httpCode == 401) {
+    consecutivePollErrors++;
+    Serial.print("HTTP poll error: ");
+    Serial.print(httpCode);
+    Serial.print(" (consecutive errors: ");
+    Serial.print(consecutivePollErrors);
+    Serial.println(")");
+
+    // If we get too many 401 errors, the device might not exist in DB
+    // Clear poll secret to force re-claim
+    if (consecutivePollErrors >= maxPollErrors) {
+      Serial.println("Too many 401 errors. Device may not exist in database.");
+      Serial.println("Clearing poll secret to force re-claim...");
+      prefs.remove("poll_secret");
+      prefs.remove("webhook_url");
+      pollSecret = "";
+      webhookUrl = "";
+      // Reload claim code in case it was stored
+      claimCode = prefs.getString("claim_code", "");
+      consecutivePollErrors = 0; // Reset counter
+      if (!claimCode.isEmpty()) {
+        Serial.println("Poll secret cleared. Device will attempt to re-claim "
+                       "on next loop.");
+      } else {
+        Serial.println("Poll secret cleared, but no claim code found. Device "
+                       "needs to be reset to re-enter claim code.");
+      }
+    }
   } else {
     Serial.print("HTTP poll error: ");
     Serial.println(httpCode);
+    consecutivePollErrors = 0; // Reset on non-401 errors
   }
 
   http.end();

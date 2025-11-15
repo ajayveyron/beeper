@@ -143,6 +143,13 @@ app.get('/link', async (req, res) => {
             <code id="curl-command">${escapeHtml(curlCommand)}</code>
             <button class="copy primary" data-copy="${escapeHtml(curlCommand)}">Copy curl Command</button>
           </div>
+          <div class="info-block">
+            <button class="test-webhook" data-webhook-url="${escapeHtml(webhookUrl)}">
+              <span class="test-webhook-text">Test Webhook Trigger</span>
+              <span class="test-webhook-spinner" style="display: none;">⏳</span>
+            </button>
+            <div class="test-webhook-feedback" style="display: none;"></div>
+          </div>
         </section>
       `;
     }
@@ -305,6 +312,55 @@ app.get('/link', async (req, res) => {
           .copy.primary:hover {
             box-shadow: 0 26px 48px rgba(46, 204, 113, 0.5);
           }
+          .test-webhook {
+            justify-self: start;
+            padding: 1rem 1.5rem;
+            border-radius: 0.8rem;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            box-shadow: 0 22px 44px rgba(102, 126, 234, 0.4);
+          }
+          .test-webhook:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 26px 48px rgba(102, 126, 234, 0.5);
+          }
+          .test-webhook:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+          }
+          .test-webhook-spinner {
+            display: inline-block;
+            animation: spin 1s linear infinite;
+          }
+          @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+          }
+          .test-webhook-feedback {
+            margin-top: 0.75rem;
+            padding: 0.75rem 1rem;
+            border-radius: 0.6rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+          }
+          .test-webhook-feedback.success {
+            background: rgba(46, 204, 113, 0.2);
+            border: 1px solid rgba(46, 204, 113, 0.4);
+            color: #2ecc71;
+          }
+          .test-webhook-feedback.error {
+            background: rgba(255, 107, 129, 0.2);
+            border: 1px solid rgba(255, 107, 129, 0.4);
+            color: #ff6b81;
+          }
           .subtitle {
             color: rgba(255, 255, 255, 0.85);
             margin-bottom: 1.25rem;
@@ -343,6 +399,65 @@ app.get('/link', async (req, res) => {
               }).catch(function() {
                 btn.textContent = 'Copy failed';
                 setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+              });
+            });
+          });
+
+          document.querySelectorAll('.test-webhook').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var webhookUrl = btn.getAttribute('data-webhook-url');
+              if (!webhookUrl) { return; }
+
+              var textSpan = btn.querySelector('.test-webhook-text');
+              var spinnerSpan = btn.querySelector('.test-webhook-spinner');
+              var feedbackDiv = btn.parentElement.querySelector('.test-webhook-feedback');
+
+              // Disable button and show spinner
+              btn.disabled = true;
+              textSpan.textContent = 'Testing...';
+              spinnerSpan.style.display = 'inline-block';
+              feedbackDiv.style.display = 'none';
+
+              // Make the webhook request
+              fetch(webhookUrl, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-admin-secret': '${ADMIN_SECRET}'
+                },
+                body: JSON.stringify({ trigger: true })
+              })
+              .then(function(response) {
+                return response.json().then(function(data) {
+                  return { ok: response.ok, data: data };
+                });
+              })
+              .then(function(result) {
+                // Reset button
+                btn.disabled = false;
+                textSpan.textContent = 'Test Webhook Trigger';
+                spinnerSpan.style.display = 'none';
+
+                // Show feedback
+                feedbackDiv.style.display = 'block';
+                if (result.ok && result.data && result.data.ok) {
+                  feedbackDiv.className = 'test-webhook-feedback success';
+                  feedbackDiv.textContent = '✓ Webhook triggered successfully! Your device should beep shortly.';
+                } else {
+                  feedbackDiv.className = 'test-webhook-feedback error';
+                  feedbackDiv.textContent = '✗ Failed to trigger webhook: ' + (result.data?.msg || 'Unknown error');
+                }
+              })
+              .catch(function(error) {
+                // Reset button
+                btn.disabled = false;
+                textSpan.textContent = 'Test Webhook Trigger';
+                spinnerSpan.style.display = 'none';
+
+                // Show error feedback
+                feedbackDiv.style.display = 'block';
+                feedbackDiv.className = 'test-webhook-feedback error';
+                feedbackDiv.textContent = '✗ Network error: ' + (error.message || 'Failed to connect');
               });
             });
           });
@@ -433,8 +548,9 @@ app.post('/api/device/claim', async (req, res) => {
 
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
+ * Authentication is provided via the webhook secret in the URL path.
  */
-app.post('/api/device/webhook/:deviceId/:webhookSecret', requireAdmin, async (req, res) => {
+app.post('/api/device/webhook/:deviceId/:webhookSecret', async (req, res) => {
   const { deviceId, webhookSecret } = req.params;
   const normalizedDeviceId = normalizeDeviceId(deviceId);
 
