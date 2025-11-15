@@ -620,8 +620,11 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
   console.log(`[WEBHOOK] Received webhook for device ${normalizedDeviceId}`);
   console.log(`[WEBHOOK] Headers:`, Object.keys(req.headers).reduce((acc, key) => {
     // Don't log sensitive headers in full
-    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization') || key.toLowerCase().includes('signature')) {
+    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization')) {
       acc[key] = req.headers[key] ? `${req.headers[key].substring(0, 8)}...` : undefined;
+    } else if (key.toLowerCase().includes('signature')) {
+      // Log signature header but truncate it (it's long)
+      acc[key] = req.headers[key] ? `${req.headers[key].substring(0, 20)}...` : undefined;
     } else {
       acc[key] = req.headers[key];
     }
@@ -642,53 +645,58 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
       return res.status(500).json({ ok: false, msg: 'webhook secret not configured for device' });
     }
 
-    // Check for Framer-style HMAC signature verification (X-Webhook-Signature header)
-    const framerSignature = req.headers['x-webhook-signature'] || req.headers['X-Webhook-Signature'];
-    if (framerSignature) {
-      console.log(`[WEBHOOK] Detected Framer-style signature authentication`);
+    // Check for Framer-style HMAC signature verification
+    // Framer uses 'framer-signature' header with format 'sha256=<hex>'
+    // Also check for standard 'x-webhook-signature' for other services
+    const framerSignatureHeader = req.headers['framer-signature'] || req.headers['Framer-Signature'];
+    const standardSignatureHeader = req.headers['x-webhook-signature'] || req.headers['X-Webhook-Signature'];
+    const signatureHeader = framerSignatureHeader || standardSignatureHeader;
+    
+    if (signatureHeader) {
+      console.log(`[WEBHOOK] Detected signature authentication (${framerSignatureHeader ? 'Framer' : 'standard'})`);
+      
+      // Extract signature from header (Framer format: 'sha256=<hex>', standard: just hex)
+      let receivedSig = signatureHeader;
+      if (signatureHeader.startsWith('sha256=')) {
+        receivedSig = signatureHeader.substring(7); // Remove 'sha256=' prefix
+      }
+      receivedSig = receivedSig.toLowerCase().trim();
       
       // Get raw body for signature verification
       const rawBody = req.rawBody ? req.rawBody.toString() : JSON.stringify(req.body);
       const timestamp = req.headers['x-webhook-timestamp'] || req.headers['X-Webhook-Timestamp'] || '';
       
-      // Framer uses: HMAC-SHA256(timestamp + rawBody, secret)
-      // Some implementations use just the body, let's try both
-      const payloadToSign = timestamp ? `${timestamp}${rawBody}` : rawBody;
-      const expectedSignature = crypto
+      // Framer uses: HMAC-SHA256(rawBody, secret)
+      // Some implementations use timestamp + body, let's try both
+      let expectedSignature = crypto
         .createHmac('sha256', record.webhookSecret)
-        .update(payloadToSign)
-        .digest('hex');
+        .update(rawBody)
+        .digest('hex')
+        .toLowerCase();
       
-      // Compare signatures (use constant-time comparison for security)
-      const receivedSig = framerSignature.toLowerCase();
-      const expectedSig = expectedSignature.toLowerCase();
+      let signatureMatches = receivedSig === expectedSignature;
       
-      if (receivedSig !== expectedSig) {
-        // Try without timestamp if timestamp was provided
-        if (timestamp) {
-          const expectedSignatureNoTimestamp = crypto
-            .createHmac('sha256', record.webhookSecret)
-            .update(rawBody)
-            .digest('hex')
-            .toLowerCase();
-          
-          if (receivedSig !== expectedSignatureNoTimestamp) {
-            console.log(`[WEBHOOK] Framer signature mismatch for device ${normalizedDeviceId}`);
-            console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
-            console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSig.substring(0, 16)}...`);
-            console.log(`[WEBHOOK] Raw body length: ${rawBody.length}, Timestamp: ${timestamp || 'none'}`);
-            return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
-          }
-        } else {
-          console.log(`[WEBHOOK] Framer signature mismatch for device ${normalizedDeviceId}`);
-          console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
-          console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSig.substring(0, 16)}...`);
-          console.log(`[WEBHOOK] Raw body length: ${rawBody.length}`);
-          return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
-        }
+      // Try with timestamp if signature doesn't match and timestamp is provided
+      if (!signatureMatches && timestamp) {
+        const payloadToSign = `${timestamp}${rawBody}`;
+        expectedSignature = crypto
+          .createHmac('sha256', record.webhookSecret)
+          .update(payloadToSign)
+          .digest('hex')
+          .toLowerCase();
+        signatureMatches = receivedSig === expectedSignature;
       }
       
-      console.log(`[WEBHOOK] Framer signature authentication successful for device ${normalizedDeviceId}`);
+      if (!signatureMatches) {
+        console.log(`[WEBHOOK] Signature mismatch for device ${normalizedDeviceId}`);
+        console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
+        console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSignature.substring(0, 16)}...`);
+        console.log(`[WEBHOOK] Raw body length: ${rawBody.length}, Timestamp: ${timestamp || 'none'}`);
+        console.log(`[WEBHOOK] Raw body preview: ${rawBody.substring(0, 100)}...`);
+        return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
+      }
+      
+      console.log(`[WEBHOOK] Signature authentication successful for device ${normalizedDeviceId}`);
     } else {
       // Fall back to direct secret comparison for other services
       let webhookSecret = 
