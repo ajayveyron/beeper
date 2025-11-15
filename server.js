@@ -585,23 +585,80 @@ app.post('/api/device/claim', async (req, res) => {
 
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
- * Authentication is provided via the x-webhook-secret header.
+ * Authentication is provided via multiple methods for compatibility:
+ * 1. x-webhook-secret header (preferred)
+ * 2. Authorization: Bearer <secret> header
+ * 3. Query parameter: ?secret=<secret>
+ * 4. Request body: { "secret": "<secret>" }
  */
 app.post('/api/device/webhook/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
-  const webhookSecret = req.headers['x-webhook-secret'];
   const normalizedDeviceId = normalizeDeviceId(deviceId);
 
+  // Log incoming request for debugging (only log headers, not full body for security)
+  console.log(`[WEBHOOK] Received webhook for device ${normalizedDeviceId}`);
+  console.log(`[WEBHOOK] Headers:`, Object.keys(req.headers).reduce((acc, key) => {
+    // Don't log sensitive headers in full
+    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization')) {
+      acc[key] = req.headers[key] ? `${req.headers[key].substring(0, 8)}...` : undefined;
+    } else {
+      acc[key] = req.headers[key];
+    }
+    return acc;
+  }, {}));
+  console.log(`[WEBHOOK] Query params:`, Object.keys(req.query));
+  console.log(`[WEBHOOK] Body keys:`, req.body ? Object.keys(req.body) : 'none');
+
+  // Try multiple authentication methods for compatibility with different webhook providers
+  let webhookSecret = 
+    req.headers['x-webhook-secret'] || // Custom header (preferred)
+    (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].split(' ')[1] : null) || // Bearer token (standard)
+    req.query.secret || // Query parameter
+    req.body?.secret || // Request body
+    req.body?.webhook_secret; // Alternative body field name
+
+  // Also check for Authorization header without Bearer prefix (some services send it directly)
+  if (!webhookSecret && req.headers['authorization']) {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader.startsWith('Bearer ')) {
+      webhookSecret = authHeader;
+    }
+  }
+
+  // Check for Basic Auth (username:password format)
+  if (!webhookSecret && req.headers['authorization']?.startsWith('Basic ')) {
+    try {
+      const base64Credentials = req.headers['authorization'].split(' ')[1];
+      const credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+      const [username, password] = credentials.split(':');
+      // Some services use username as device ID and password as secret, or vice versa
+      webhookSecret = password || username;
+    } catch (e) {
+      // Ignore Basic Auth parsing errors
+    }
+  }
+
   if (!webhookSecret) {
-    return res.status(401).json({ ok: false, msg: 'x-webhook-secret header required' });
+    console.log(`[WEBHOOK] Authentication failed: No secret found in any expected location`);
+    return res.status(401).json({ ok: false, msg: 'webhook authentication required. Provide secret via x-webhook-secret header, Authorization header, ?secret query param, or body.secret' });
   }
 
   try {
     const record = await deviceStore.getByDeviceId(normalizedDeviceId);
-    if (!record || record.webhookSecret !== webhookSecret) {
-      return res.status(404).json({ ok: false, msg: 'unknown webhook' });
+    if (!record) {
+      console.log(`[WEBHOOK] Device ${normalizedDeviceId} not found`);
+      return res.status(404).json({ ok: false, msg: 'device not found' });
+    }
+    
+    if (record.webhookSecret !== webhookSecret) {
+      console.log(`[WEBHOOK] Secret mismatch for device ${normalizedDeviceId}`);
+      console.log(`[WEBHOOK] Received secret (first 8 chars): ${webhookSecret.substring(0, 8)}...`);
+      console.log(`[WEBHOOK] Expected secret (first 8 chars): ${record.webhookSecret?.substring(0, 8)}...`);
+      return res.status(401).json({ ok: false, msg: 'invalid webhook secret' });
     }
 
+    console.log(`[WEBHOOK] Authentication successful for device ${normalizedDeviceId}`);
+    
     // Set the trigger flag for device polling
     await deviceStore.setTrigger(normalizedDeviceId, true);
     // Create a trigger record in the triggers table for tracking
@@ -609,7 +666,7 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
     
     return res.json({ ok: true });
   } catch (error) {
-    console.error('webhook trigger failed', error);
+    console.error('[WEBHOOK] webhook trigger failed', error);
     return res.status(500).json({ ok: false, msg: 'failed to queue trigger' });
   }
 });
