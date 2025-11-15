@@ -404,6 +404,8 @@ app.post('/api/device/claim', async (req, res) => {
     const webhookSecret = record.webhookSecret || generateSecret();
     await deviceStore.setSecrets(normalizedDeviceId, { pollSecret, webhookSecret });
 
+    console.log(`[CLAIM] Device ${normalizedDeviceId} claimed successfully. Poll secret: ${pollSecret.substring(0, 8)}...`);
+
     const baseUrl = resolveBaseUrl(req);
     const webhookUrl = `${baseUrl}/api/device/webhook/${normalizedDeviceId}/${webhookSecret}`;
 
@@ -456,7 +458,17 @@ app.get('/api/device/status', async (req, res) => {
 
   try {
     const record = await deviceStore.getByDeviceId(normalizedDeviceId);
-    if (!record || record.pollSecret !== pollSecret) {
+    if (!record) {
+      console.error(`[POLL] Device not found: ${normalizedDeviceId} (original: ${deviceId})`);
+      return res.status(401).json({ ok: false, msg: 'unauthorized' });
+    }
+    if (record.pollSecret !== pollSecret) {
+      console.error(`[POLL] Secret mismatch for device ${normalizedDeviceId}:`, {
+        received: pollSecret,
+        expected: record.pollSecret,
+        receivedLength: pollSecret?.length,
+        expectedLength: record.pollSecret?.length,
+      });
       return res.status(401).json({ ok: false, msg: 'unauthorized' });
     }
 
