@@ -9,6 +9,19 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'Lacubra534';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 
 const app = express();
+// Store raw body for signature verification (needed for Framer)
+// This must come before bodyParser.json() to capture raw body
+app.use('/api/device/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
+  // Store raw body for signature verification, then parse as JSON
+  req.rawBody = req.body;
+  try {
+    req.body = JSON.parse(req.body.toString());
+  } catch (e) {
+    req.body = {};
+  }
+  next();
+});
+// Parse JSON for all other routes
 app.use(bodyParser.json());
 
 const generateSecret = () => crypto.randomBytes(16).toString('hex');
@@ -586,6 +599,11 @@ app.post('/api/device/claim', async (req, res) => {
 /**
  * Endpoint customers call (via their automation/webhook) to trigger the device.
  * Authentication is provided via multiple methods for compatibility:
+ * 
+ * For Framer and HMAC-based services:
+ * - X-Webhook-Signature header: HMAC-SHA256 signature of the request body
+ * 
+ * For direct secret services:
  * 1. x-webhook-secret header (preferred - most secure, secret not in URL)
  * 2. Authorization: Bearer <secret> header
  * 3. Query parameter: ?secret=<secret> (less secure, secret visible in logs)
@@ -602,7 +620,7 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
   console.log(`[WEBHOOK] Received webhook for device ${normalizedDeviceId}`);
   console.log(`[WEBHOOK] Headers:`, Object.keys(req.headers).reduce((acc, key) => {
     // Don't log sensitive headers in full
-    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization')) {
+    if (key.toLowerCase().includes('secret') || key.toLowerCase().includes('authorization') || key.toLowerCase().includes('signature')) {
       acc[key] = req.headers[key] ? `${req.headers[key].substring(0, 8)}...` : undefined;
     } else {
       acc[key] = req.headers[key];
@@ -612,55 +630,109 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
   console.log(`[WEBHOOK] Query params:`, Object.keys(req.query));
   console.log(`[WEBHOOK] Body keys:`, req.body ? Object.keys(req.body) : 'none');
 
-  // Try multiple authentication methods for compatibility with different webhook providers
-  let webhookSecret = 
-    req.headers['x-webhook-secret'] || // Custom header (preferred)
-    (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].split(' ')[1] : null) || // Bearer token (standard)
-    req.query.secret || // Query parameter
-    req.body?.secret || // Request body
-    req.body?.webhook_secret; // Alternative body field name
-
-  // Also check for Authorization header without Bearer prefix (some services send it directly)
-  if (!webhookSecret && req.headers['authorization']) {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader.startsWith('Bearer ')) {
-      webhookSecret = authHeader;
-    }
-  }
-
-  // Check for Basic Auth (username:password format)
-  if (!webhookSecret && req.headers['authorization']?.startsWith('Basic ')) {
-    try {
-      const base64Credentials = req.headers['authorization'].split(' ')[1];
-      const credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
-      const [username, password] = credentials.split(':');
-      // Some services use username as device ID and password as secret, or vice versa
-      webhookSecret = password || username;
-    } catch (e) {
-      // Ignore Basic Auth parsing errors
-    }
-  }
-
-  if (!webhookSecret) {
-    console.log(`[WEBHOOK] Authentication failed: No secret found in any expected location`);
-    return res.status(401).json({ ok: false, msg: 'webhook authentication required. Provide secret via x-webhook-secret header, Authorization header, ?secret query param, or body.secret' });
-  }
-
   try {
     const record = await deviceStore.getByDeviceId(normalizedDeviceId);
     if (!record) {
       console.log(`[WEBHOOK] Device ${normalizedDeviceId} not found`);
       return res.status(404).json({ ok: false, msg: 'device not found' });
     }
-    
-    if (record.webhookSecret !== webhookSecret) {
-      console.log(`[WEBHOOK] Secret mismatch for device ${normalizedDeviceId}`);
-      console.log(`[WEBHOOK] Received secret (first 8 chars): ${webhookSecret.substring(0, 8)}...`);
-      console.log(`[WEBHOOK] Expected secret (first 8 chars): ${record.webhookSecret?.substring(0, 8)}...`);
-      return res.status(401).json({ ok: false, msg: 'invalid webhook secret' });
+
+    if (!record.webhookSecret) {
+      console.log(`[WEBHOOK] Device ${normalizedDeviceId} has no webhook secret configured`);
+      return res.status(500).json({ ok: false, msg: 'webhook secret not configured for device' });
     }
 
-    console.log(`[WEBHOOK] Authentication successful for device ${normalizedDeviceId}`);
+    // Check for Framer-style HMAC signature verification (X-Webhook-Signature header)
+    const framerSignature = req.headers['x-webhook-signature'] || req.headers['X-Webhook-Signature'];
+    if (framerSignature) {
+      console.log(`[WEBHOOK] Detected Framer-style signature authentication`);
+      
+      // Get raw body for signature verification
+      const rawBody = req.rawBody ? req.rawBody.toString() : JSON.stringify(req.body);
+      const timestamp = req.headers['x-webhook-timestamp'] || req.headers['X-Webhook-Timestamp'] || '';
+      
+      // Framer uses: HMAC-SHA256(timestamp + rawBody, secret)
+      // Some implementations use just the body, let's try both
+      const payloadToSign = timestamp ? `${timestamp}${rawBody}` : rawBody;
+      const expectedSignature = crypto
+        .createHmac('sha256', record.webhookSecret)
+        .update(payloadToSign)
+        .digest('hex');
+      
+      // Compare signatures (use constant-time comparison for security)
+      const receivedSig = framerSignature.toLowerCase();
+      const expectedSig = expectedSignature.toLowerCase();
+      
+      if (receivedSig !== expectedSig) {
+        // Try without timestamp if timestamp was provided
+        if (timestamp) {
+          const expectedSignatureNoTimestamp = crypto
+            .createHmac('sha256', record.webhookSecret)
+            .update(rawBody)
+            .digest('hex')
+            .toLowerCase();
+          
+          if (receivedSig !== expectedSignatureNoTimestamp) {
+            console.log(`[WEBHOOK] Framer signature mismatch for device ${normalizedDeviceId}`);
+            console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
+            console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSig.substring(0, 16)}...`);
+            console.log(`[WEBHOOK] Raw body length: ${rawBody.length}, Timestamp: ${timestamp || 'none'}`);
+            return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
+          }
+        } else {
+          console.log(`[WEBHOOK] Framer signature mismatch for device ${normalizedDeviceId}`);
+          console.log(`[WEBHOOK] Received signature (first 16 chars): ${receivedSig.substring(0, 16)}...`);
+          console.log(`[WEBHOOK] Expected signature (first 16 chars): ${expectedSig.substring(0, 16)}...`);
+          console.log(`[WEBHOOK] Raw body length: ${rawBody.length}`);
+          return res.status(401).json({ ok: false, msg: 'invalid webhook signature' });
+        }
+      }
+      
+      console.log(`[WEBHOOK] Framer signature authentication successful for device ${normalizedDeviceId}`);
+    } else {
+      // Fall back to direct secret comparison for other services
+      let webhookSecret = 
+        req.headers['x-webhook-secret'] || // Custom header (preferred)
+        (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].split(' ')[1] : null) || // Bearer token (standard)
+        req.query.secret || // Query parameter
+        req.body?.secret || // Request body
+        req.body?.webhook_secret; // Alternative body field name
+
+      // Also check for Authorization header without Bearer prefix (some services send it directly)
+      if (!webhookSecret && req.headers['authorization']) {
+        const authHeader = req.headers['authorization'];
+        if (!authHeader.startsWith('Bearer ')) {
+          webhookSecret = authHeader;
+        }
+      }
+
+      // Check for Basic Auth (username:password format)
+      if (!webhookSecret && req.headers['authorization']?.startsWith('Basic ')) {
+        try {
+          const base64Credentials = req.headers['authorization'].split(' ')[1];
+          const credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+          const [username, password] = credentials.split(':');
+          // Some services use username as device ID and password as secret, or vice versa
+          webhookSecret = password || username;
+        } catch (e) {
+          // Ignore Basic Auth parsing errors
+        }
+      }
+
+      if (!webhookSecret) {
+        console.log(`[WEBHOOK] Authentication failed: No secret or signature found in any expected location`);
+        return res.status(401).json({ ok: false, msg: 'webhook authentication required. Provide secret via x-webhook-secret header, X-Webhook-Signature header (for Framer), Authorization header, ?secret query param, or body.secret' });
+      }
+
+      if (record.webhookSecret !== webhookSecret) {
+        console.log(`[WEBHOOK] Secret mismatch for device ${normalizedDeviceId}`);
+        console.log(`[WEBHOOK] Received secret (first 8 chars): ${webhookSecret.substring(0, 8)}...`);
+        console.log(`[WEBHOOK] Expected secret (first 8 chars): ${record.webhookSecret?.substring(0, 8)}...`);
+        return res.status(401).json({ ok: false, msg: 'invalid webhook secret' });
+      }
+
+      console.log(`[WEBHOOK] Direct secret authentication successful for device ${normalizedDeviceId}`);
+    }
     
     // Set the trigger flag for device polling
     await deviceStore.setTrigger(normalizedDeviceId, true);
