@@ -5,9 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_wifi.h>
-
-// I2S audio playback using MAX98357 and ESP32-audioI2S `Audio` class
-#include "Audio.h"
+#include <Audio.h>
 
 // ---------- Cloud configuration ----------
 const char *backendBaseUrl = "https://beeper-ps1z.onrender.com";
@@ -18,28 +16,82 @@ const unsigned long pollIntervalMs = 3000;
 const unsigned long wifiConnectTimeoutMs = 20000;
 
 // ---------- Hardware ----------
-const int buzzerPin = 4;       // GPIO4 (moved off 15 to avoid I2S conflict)
+const int buzzerPin = 4;       // GPIO4
 const int resetButtonPin = 14; // GPIO14; connect to GND when pressed
 
-// ---------- Audio (MAX98357 over I2S) ----------
-// For v1, we stream a short MP3 from a local HTTP server.
-// Option A: Node server at /audio/kalimba (port 3000)
-// Option B (current): Python SimpleHTTPServer on port 8001 serving Kalimba.mp3
-// Make sure the ESP32 can reach 192.168.1.9 over your LAN; update IP if needed.
-const char *alertMp3Url =
-    "http://192.168.1.9:8001/Kalimba.mp3"; // Using local HTTP server
+// I2S pins for MAX98357A amplifier
+const int I2S_BCLK = 15;   // BCLK
+const int I2S_LRC = 16;    // LRCK (WS)
+const int I2S_DIN = 17;    // DIN (SD)
 
-// I2S pin mapping for MAX98357 (update if you wired differently)
-const int audioBclkPin = 15;  // connect to MAX98357 BCLK
-const int audioLrcPin = 16;   // connect to MAX98357 LRC
-const int audioDataPin = 17;  // connect to MAX98357 DIN
+// ---------- Beep pattern definitions ----------
+struct BeepPattern {
+  const char* name;
+  const int (*pattern)[2];
+  int patternLength;
+  int cycles;
+  int cyclePause;
+};
 
-Audio audio; // ESP32-audioI2S player
+// Pattern: Classic Alert (original pattern)
+const int classicAlertPattern[][2] = {
+    {120, 80}, {120, 80}, {120, 160}, // opening triple beep
+    {40, 60},  {40, 60},  {40, 200},  // quick chirps
+    {300, 70}, {300, 70},             // two strong pulses
+    {600, 400}                        // lingering finish
+};
+
+// Pattern: Short Ping
+const int shortPingPattern[][2] = {
+    {100, 100}, {100, 100}, {100, 300}
+};
+
+// Pattern: Double Buzz
+const int doubleBuzzPattern[][2] = {
+    {250, 100}, {250, 300}
+};
+
+// Pattern: Rising Alert
+const int risingAlertPattern[][2] = {
+    {100, 50}, {200, 50}, {300, 50}, {400, 200}
+};
+
+// Pattern: Morse SOS
+const int morseSosPattern[][2] = {
+    {100, 50}, {100, 50}, {100, 150},   // S (dot-dot-dot)
+    {300, 50}, {300, 50}, {300, 150},   // O (dash-dash-dash)
+    {100, 50}, {100, 50}, {100, 300}    // S (dot-dot-dot)
+};
+
+// Pattern: Gentle Chime
+const int gentleChimePattern[][2] = {
+    {50, 100}, {75, 100}, {100, 300}
+};
+
+// Pattern: Rapid Fire
+const int rapidFirePattern[][2] = {
+    {50, 50}, {50, 50}, {50, 50}, {50, 50}, {50, 50}, {50, 300}
+};
+
+// Array of available patterns
+const BeepPattern patterns[] = {
+    {"Classic Alert", classicAlertPattern, sizeof(classicAlertPattern) / sizeof(classicAlertPattern[0]), 3, 300},
+    {"Short Ping", shortPingPattern, sizeof(shortPingPattern) / sizeof(shortPingPattern[0]), 2, 200},
+    {"Double Buzz", doubleBuzzPattern, sizeof(doubleBuzzPattern) / sizeof(doubleBuzzPattern[0]), 3, 250},
+    {"Rising Alert", risingAlertPattern, sizeof(risingAlertPattern) / sizeof(risingAlertPattern[0]), 2, 200},
+    {"Morse SOS", morseSosPattern, sizeof(morseSosPattern) / sizeof(morseSosPattern[0]), 1, 0},
+    {"Gentle Chime", gentleChimePattern, sizeof(gentleChimePattern) / sizeof(gentleChimePattern[0]), 2, 150},
+    {"Rapid Fire", rapidFirePattern, sizeof(rapidFirePattern) / sizeof(rapidFirePattern[0]), 1, 0}
+};
+
+const int patternsCount = sizeof(patterns) / sizeof(patterns[0]);
 
 // ---------- Globals ----------
 Preferences prefs;
-WebServer configServer(80);
-DNSServer dnsServer;
+// Use pointers to avoid early construction issues on S3
+WebServer *configServer = nullptr;
+DNSServer *dnsServer = nullptr;
+Audio audio;  // I2S audio output for MAX98357A
 
 const byte dnsPort = 53;
 IPAddress apIp(192, 168, 4, 1);
@@ -51,6 +103,7 @@ String wifiPassword;
 String claimCode;
 String pollSecret;
 String webhookUrl;
+int selectedPattern = 0; // Index of selected pattern, default to Classic Alert
 
 bool configMode = false;
 bool shouldRestart = false;
@@ -65,7 +118,20 @@ const int maxPollErrors = 5; // After 5 consecutive 401 errors, force re-claim
 // ---------- Helper ----------
 String sanitizedMac() {
   uint8_t mac[6] = {0};
-  esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+  // Try to get MAC address from WiFi
+  esp_err_t result = esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+  // If WiFi isn't initialized yet, try AP mode or use random fallback
+  if (result != ESP_OK) {
+    Serial.print("[WARN] Failed to get MAC from STA, trying AP mode...");
+    result = esp_wifi_get_mac(WIFI_IF_AP, mac);
+    if (result != ESP_OK) {
+      Serial.println(" Failed");
+      return ""; // Return empty, caller will handle fallback
+    }
+    Serial.println(" OK (from AP)");
+  }
 
   char buffer[13];
   snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1],
@@ -80,6 +146,12 @@ void loadStoredConfig() {
   claimCode = prefs.getString("claim_code", "");
   pollSecret = prefs.getString("poll_secret", "");
   webhookUrl = prefs.getString("webhook_url", "");
+  selectedPattern = prefs.getInt("pattern_id", 0); // Default to Classic Alert (index 0)
+
+  // Validate pattern index
+  if (selectedPattern < 0 || selectedPattern >= patternsCount) {
+    selectedPattern = 0;
+  }
 }
 
 void saveWifiConfig(const String &ssid, const String &pass,
@@ -102,18 +174,29 @@ void saveClaimData(const String &secret, const String &webhook) {
   // re-claim
 }
 
+void saveSelectedPattern(int patternId) {
+  if (patternId >= 0 && patternId < patternsCount) {
+    selectedPattern = patternId;
+    prefs.putInt("pattern_id", patternId);
+    Serial.print("Pattern changed to: ");
+    Serial.println(patterns[selectedPattern].name);
+  }
+}
+
 void clearStoredConfig() {
   prefs.remove("wifi_ssid");
   prefs.remove("wifi_pass");
   prefs.remove("poll_secret");
   prefs.remove("claim_code");
   prefs.remove("webhook_url");
+  prefs.remove("pattern_id");
 
   wifiSsid = "";
   wifiPassword = "";
   pollSecret = "";
   claimCode = "";
   webhookUrl = "";
+  selectedPattern = 0;
 }
 
 bool connectToWiFi() {
@@ -327,21 +410,21 @@ void sendConfigForm() {
       "})();"
       "</script>"
       "</body></html>";
-  configServer.send(200, "text/html", form);
+  configServer->send(200, "text/html", form);
 }
 
 void sendPortalRedirect() {
-  configServer.sendHeader("Location", "http://192.168.4.1/", true);
-  configServer.send(302, "text/plain", "");
+  configServer->sendHeader("Location", "http://192.168.4.1/", true);
+  configServer->send(302, "text/plain", "");
 }
 
 void handleConfigSave() {
-  String ssid = configServer.arg("ssid");
-  String pass = configServer.arg("pass");
-  String claim = configServer.arg("claim");
+  String ssid = configServer->arg("ssid");
+  String pass = configServer->arg("pass");
+  String claim = configServer->arg("claim");
 
   if (ssid.isEmpty() || pass.isEmpty() || claim.isEmpty()) {
-    configServer.send(
+    configServer->send(
         400, "text/html",
         "<!DOCTYPE html><html><head><meta charset='utf-8'><meta "
         "name='viewport' content='width=device-width, initial-scale=1'>"
@@ -380,7 +463,7 @@ void handleConfigSave() {
   safeSsid.replace(">", "&gt;");
   safeSsid.replace("\"", "&quot;");
   safeSsid.replace("'", "&#39;");
-  configServer.send(
+  configServer->send(
       200, "text/html",
       "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' "
       "content='width=device-width, initial-scale=1'>"
@@ -424,7 +507,8 @@ void handleConfigSave() {
       "<h1>Configuration Saved</h1>"
       "<p class='lead'>Device will restart and connect to <strong>" +
           safeSsid +
-          "</strong>. Hotspot closes in ~30 seconds.</p>"
+          "</strong>. Hotspot closes in <span id='countdown'>30</span> "
+          "seconds.</p>"
           "</section>"
           "<section class='card'>"
           "<h2>Claim Lookup Portal</h2>"
@@ -479,6 +563,16 @@ void handleConfigSave() {
           "}"
           "document.querySelectorAll('[data-copy]').forEach(function(btn){btn."
           "addEventListener('click',function(){handleCopy(btn);});});"
+          "var countdownEl=document.getElementById('countdown');"
+          "if(countdownEl){"
+          "var seconds=30;"
+          "function updateCountdown(){"
+          "countdownEl.textContent=seconds;"
+          "if(seconds>0){seconds--;setTimeout(updateCountdown,1000);}"
+          "else{countdownEl.textContent='0';}"
+          "}"
+          "updateCountdown();"
+          "}"
           "})();"
           "</script></body></html>");
   shouldRestart = true;
@@ -486,6 +580,14 @@ void handleConfigSave() {
 }
 
 void startConfigPortal() {
+  // Initialize WebServer and DNSServer only when needed (lazy init for S3)
+  if (configServer == nullptr) {
+    configServer = new WebServer(80);
+  }
+  if (dnsServer == nullptr) {
+    dnsServer = new DNSServer();
+  }
+
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIp, apIp, apNetmask);
   String apSsid = "Beeper-" + deviceId.substring(deviceId.length() - 4);
@@ -495,15 +597,15 @@ void startConfigPortal() {
   Serial.println(apSsid);
   Serial.println("Connect and browse to http://192.168.4.1");
 
-  dnsServer.start(dnsPort, "*", apIp);
+  dnsServer->start(dnsPort, "*", apIp);
 
-  configServer.on("/", HTTP_GET, sendConfigForm);
-  configServer.on("/", HTTP_POST, handleConfigSave);
-  configServer.on("/generate_204", HTTP_GET, sendPortalRedirect);
-  configServer.on("/hotspot-detect.html", HTTP_GET, sendPortalRedirect);
-  configServer.on("/fwlink", HTTP_GET, sendPortalRedirect);
-  configServer.onNotFound(sendConfigForm);
-  configServer.begin();
+  configServer->on("/", HTTP_GET, sendConfigForm);
+  configServer->on("/", HTTP_POST, handleConfigSave);
+  configServer->on("/generate_204", HTTP_GET, sendPortalRedirect);
+  configServer->on("/hotspot-detect.html", HTTP_GET, sendPortalRedirect);
+  configServer->on("/fwlink", HTTP_GET, sendPortalRedirect);
+  configServer->onNotFound(sendConfigForm);
+  configServer->begin();
 
   configMode = true;
 }
@@ -622,23 +724,6 @@ bool claimDevice() {
   return false;
 }
 
-// ---------- Audio helpers ----------
-void startAlertAudio() {
-  if (alertMp3Url == nullptr || alertMp3Url[0] == '\0') {
-    Serial.println("Audio: alertMp3Url is not set, skipping playback.");
-    return;
-  }
-
-  Serial.print("Audio: starting playback from URL via I2S: ");
-  Serial.println(alertMp3Url);
-
-  // Stop any previous stream
-  audio.stopSong();
-
-  // Kick off new stream; Audio library will handle HTTP + decode + I2S
-  audio.connecttohost(alertMp3Url);
-}
-
 void pollForTrigger() {
   if (pollSecret.isEmpty()) {
     return;
@@ -673,9 +758,28 @@ void pollForTrigger() {
     Serial.print("Status response: ");
     Serial.println(payload);
     if (payload.indexOf("\"trigger\":true") >= 0) {
-      Serial.println("Trigger detected. Playing audio + beeping...");
-      startAlertAudio(); // Start MP3 playback over PAM8403
-      // beepPattern();     // Keep existing buzzer pattern for now
+      // Check for pattern_id in response
+      int patternId = 0; // default to Classic Alert
+      int patternIdIndex = payload.indexOf("\"pattern_id\":");
+      if (patternIdIndex >= 0) {
+        // Extract pattern_id value
+        int valueStart = patternIdIndex + 13; // length of "\"pattern_id\":"
+        int valueEnd = payload.indexOf(",", valueStart);
+        if (valueEnd == -1) {
+          valueEnd = payload.indexOf("}", valueStart);
+        }
+        if (valueEnd > valueStart) {
+          String patternStr = payload.substring(valueStart, valueEnd);
+          patternStr.trim();
+          patternId = patternStr.toInt();
+        }
+      }
+      saveSelectedPattern(patternId);
+      Serial.println("Trigger detected. Playing audio...");
+
+      // Build the audio URL from the backend base URL
+      String audioUrl = String(backendBaseUrl) + "/audio/chalo";
+      playAudioFile(audioUrl.c_str());
     }
     consecutivePollErrors = 0; // Reset error counter on success
   } else if (httpCode == 401) {
@@ -716,46 +820,110 @@ void pollForTrigger() {
 }
 
 void beepPattern() {
-  const int pattern[][2] = {
-      {120, 80}, {120, 80}, {120, 160}, // opening triple beep
-      {40, 60},  {40, 60},  {40, 200},  // quick chirps
-      {300, 70}, {300, 70},             // two strong pulses
-      {600, 400}                        // lingering finish
-  };
+  // Validate selected pattern index
+  int patternIdx = selectedPattern;
+  if (patternIdx < 0 || patternIdx >= patternsCount) {
+    patternIdx = 0;
+  }
 
-  const int patternLength = sizeof(pattern) / sizeof(pattern[0]);
+  const BeepPattern &bp = patterns[patternIdx];
+  Serial.print("Playing pattern: ");
+  Serial.println(bp.name);
 
-  for (int cycle = 0; cycle < 3; cycle++) {
-    for (int i = 0; i < patternLength; i++) {
+  for (int cycle = 0; cycle < bp.cycles; cycle++) {
+    for (int i = 0; i < bp.patternLength; i++) {
       digitalWrite(buzzerPin, HIGH);
-      delay(pattern[i][0]);
+      delay(bp.pattern[i][0]);
       digitalWrite(buzzerPin, LOW);
-      delay(pattern[i][1]);
+      delay(bp.pattern[i][1]);
     }
-    if (cycle < 2) {
-      delay(300); // short pause before repeating
+    if (cycle < bp.cycles - 1 && bp.cyclePause > 0) {
+      delay(bp.cyclePause); // pause before repeating
     }
   }
 }
 
+void playAudioFile(const char *audioUrl) {
+  Serial.print("[AUDIO] Playing audio from: ");
+  Serial.println(audioUrl);
+
+  // Connect to the audio URL and stream it through the MAX98357A amplifier
+  audio.connecttohost(audioUrl);
+
+  // Give it a moment to start
+  delay(500);
+
+  // Keep the audio object processing the stream
+  // The audio.loop() function is called regularly in the main loop
+  unsigned long timeout = millis() + 30000; // 30 second timeout
+
+  while (millis() < timeout && audio.isRunning()) {
+    audio.loop();
+    delay(10);
+  }
+
+  Serial.println("[AUDIO] Playback finished");
+}
+
 void setup() {
+  // Seed random number generator
+  randomSeed(analogRead(0));
+
+  // Wait longer for USB CDC on ESP32-S3
+  delay(3000);
+
   Serial.begin(115200);
+
+  // On ESP32-S3, Serial might not be detected as "ready" but will still work
+  // Don't block - just wait a bit then start printing
+  delay(1000);
+
+  Serial.println("\n\n[BOOT] =========================================");
+  Serial.println("[BOOT] ESP32-S3 Beeper starting...");
+  Serial.print("[BOOT] Chip Model: ");
+  Serial.println(ESP.getChipModel());
+  Serial.print("[BOOT] Chip Revision: ");
+  Serial.println(ESP.getChipRevision());
+  Serial.print("[BOOT] CPU Frequency: ");
+  Serial.print(ESP.getCpuFreqMHz());
+  Serial.println(" MHz");
+  Serial.println("[BOOT] Serial initialized successfully");
+  Serial.flush();
 
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
+  Serial.println("[BOOT] Buzzer pin configured");
+  Serial.flush();
+
   pinMode(resetButtonPin, INPUT_PULLUP);
+  Serial.println("[BOOT] Reset button pin configured");
+  Serial.flush();
 
   prefs.begin("beeper", false);
+  Serial.println("[BOOT] Preferences initialized");
 
+  // Initialize I2S audio for MAX98357A amplifier
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
+  audio.setVolume(21); // 0-21 volume range
+  Serial.println("[BOOT] I2S audio configured (MAX98357A)");
+  Serial.flush();
+
+  // Initialize WiFi
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false); // We handle reconnection manually
+  Serial.println("[BOOT] WiFi mode set to STA");
+  Serial.flush();
 
-  // Configure MAX98357 I2S output
-  audio.setPinout(audioBclkPin, audioLrcPin, audioDataPin);
-  audio.setVolume(16); // 0..21
-
+  // Get device ID (MAC address)
+  delay(100); // Small delay for WiFi to initialize
   deviceId = sanitizedMac();
-  Serial.print("Device ID: ");
+  if (deviceId.isEmpty() || deviceId.length() != 12) {
+    Serial.println("[BOOT] WARNING: Failed to get MAC address, using fallback");
+    deviceId = "UNKNOWN" + String(random(1000, 9999));
+  }
+  Serial.print("[BOOT] Device ID: ");
   Serial.println(deviceId);
+  Serial.flush();
 
   loadStoredConfig();
 
@@ -774,14 +942,18 @@ void setup() {
 }
 
 void loop() {
-  // Keep audio decoding/streaming going
+  // Keep audio processing (non-blocking)
   audio.loop();
 
   checkResetButton();
 
   if (configMode) {
-    dnsServer.processNextRequest();
-    configServer.handleClient();
+    if (dnsServer != nullptr) {
+      dnsServer->processNextRequest();
+    }
+    if (configServer != nullptr) {
+      configServer->handleClient();
+    }
 
     if (shouldRestart && restartRequestTime > 0) {
       unsigned long elapsed = millis() - restartRequestTime;

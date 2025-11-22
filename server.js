@@ -60,6 +60,18 @@ app.get('/audio/kalimba', (_req, res) => {
   });
 });
 
+app.get('/audio/chalo', (_req, res) => {
+  const filePath = path.join(__dirname, 'chalo.mp3');
+  res.sendFile(filePath, (err) => {
+    if (err) {
+      console.error('Error sending chalo audio file', err);
+      if (!res.headersSent) {
+        res.status(500).send('audio error');
+      }
+    }
+  });
+});
+
 const normalizeClaimCode = (value = '') => String(value).trim().toUpperCase();
 const normalizeDeviceId = (value = '') => String(value).trim().toUpperCase();
 
@@ -163,12 +175,35 @@ app.get('/link', async (req, res) => {
       const webhookUrl = `${baseUrl}/api/device/webhook/${match.id}`;
       const webhookSecret = match.record.webhookSecret;
       const pollSecret = match.record.pollSecret;
-      const curlCommand = `curl -X POST "${webhookUrl}" -H 'Content-Type: application/json' -H 'x-webhook-secret: ${escapeHtml(webhookSecret)}' -d '{"trigger":true}'`;
+      const curlCommand = `curl -X POST "${webhookUrl}" -H 'Content-Type: application/json' -H 'x-webhook-secret: ${escapeHtml(webhookSecret)}' -d '{"trigger":true,"pattern_id":0}'`;
+
+      // Pattern definitions matching beeper.ino
+      const patterns = [
+        { id: 0, name: 'Classic Alert', description: 'Original multi-beep pattern with pulses' },
+        { id: 1, name: 'Short Ping', description: 'Quick triple ping' },
+        { id: 2, name: 'Double Buzz', description: 'Two long buzzes' },
+        { id: 3, name: 'Rising Alert', description: 'Progressively longer tones' },
+        { id: 4, name: 'Morse SOS', description: 'SOS pattern (dot-dot-dot, dash-dash-dash, dot-dot-dot)' },
+        { id: 5, name: 'Gentle Chime', description: 'Soft ascending chime' },
+        { id: 6, name: 'Rapid Fire', description: 'Fast rapid-fire beeps' }
+      ];
+
+      let patternOptions = patterns.map(p => `<option value="${p.id}">${p.name} - ${p.description}</option>`).join('');
 
       bodyContent += `
         <section class="card success">
           <h2>Device Ready</h2>
           <p class="subtitle">Device <strong>${escapeHtml(match.id)}</strong> is connected and ready to use. Copy the values below into your automation or app.</p>
+          <div class="info-block">
+            <div class="info-header">BEEP PATTERN</div>
+            <p class="info-description">Choose a beep pattern for this device. You can also specify the pattern when triggering via the webhook.</p>
+            <div style="display: grid; gap: 1rem;">
+              <select id="pattern-select" style="padding: 0.85rem 1rem; border-radius: 0.85rem; border: 1px solid rgba(102, 139, 255, 0.4); background: rgba(15, 22, 49, 0.92); color: #f4f7ff; font-size: 1rem;">
+                ${patternOptions}
+              </select>
+              <button id="preview-button" style="padding: 0.85rem 1.2rem; border-radius: 0.85rem; border: none; background: #5c7cfa; color: white; font-weight: 600; cursor: pointer;">Play Preview</button>
+            </div>
+          </div>
           <div class="info-block">
             <div class="info-header">WEBHOOK URL</div>
             <p class="info-description">Use this URL to make your device beep. Keep this URL private. The secret must be provided in the x-webhook-secret header, not in the URL.</p>
@@ -460,10 +495,85 @@ app.get('/link', async (req, res) => {
             });
           });
 
+          // Pattern definitions for preview (matches beeper.ino)
+          var patterns = [
+            { name: 'Classic Alert', tones: [[120, 80], [120, 80], [120, 160], [40, 60], [40, 60], [40, 200], [300, 70], [300, 70], [600, 400]] },
+            { name: 'Short Ping', tones: [[100, 100], [100, 100], [100, 300]] },
+            { name: 'Double Buzz', tones: [[250, 100], [250, 300]] },
+            { name: 'Rising Alert', tones: [[100, 50], [200, 50], [300, 50], [400, 200]] },
+            { name: 'Morse SOS', tones: [[100, 50], [100, 50], [100, 150], [300, 50], [300, 50], [300, 150], [100, 50], [100, 50], [100, 300]] },
+            { name: 'Gentle Chime', tones: [[50, 100], [75, 100], [100, 300]] },
+            { name: 'Rapid Fire', tones: [[50, 50], [50, 50], [50, 50], [50, 50], [50, 50], [50, 300]] }
+          ];
+
+          // Preview button functionality
+          var previewBtn = document.getElementById('preview-button');
+          var patternSelect = document.getElementById('pattern-select');
+          var audioContext = null;
+
+          function initAudioContext() {
+            if (!audioContext) {
+              audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            return audioContext;
+          }
+
+          function playPreview() {
+            var ctx = initAudioContext();
+            var patternIdx = parseInt(patternSelect.value);
+            var pattern = patterns[patternIdx];
+
+            if (!pattern) { return; }
+
+            var now = ctx.currentTime;
+            var time = now;
+            var frequency = 1000; // Hz for buzzer simulation
+
+            // Create oscillator for audible tone (uses Web Audio API)
+            pattern.tones.forEach(function(tone) {
+              var onDuration = tone[0] / 1000; // Convert ms to seconds
+              var offDuration = tone[1] / 1000;
+
+              // Play tone if duration > 0
+              if (onDuration > 0) {
+                var osc = ctx.createOscillator();
+                var gain = ctx.createGain();
+
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+
+                osc.frequency.value = frequency;
+                gain.gain.setValueAtTime(0.1, time);
+                gain.gain.setValueAtTime(0, time + onDuration);
+
+                osc.start(time);
+                osc.stop(time + onDuration);
+              }
+
+              time += onDuration + offDuration;
+            });
+
+            // Update button state
+            if (previewBtn) {
+              previewBtn.disabled = true;
+              var original = previewBtn.textContent;
+              previewBtn.textContent = 'Playing...';
+              setTimeout(function() {
+                previewBtn.textContent = original;
+                previewBtn.disabled = false;
+              }, (time - now) * 1000);
+            }
+          }
+
+          if (previewBtn) {
+            previewBtn.addEventListener('click', playPreview);
+          }
+
           document.querySelectorAll('.test-webhook').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var webhookUrl = btn.getAttribute('data-webhook-url');
               var webhookSecret = btn.getAttribute('data-webhook-secret');
+              var patternId = patternSelect ? parseInt(patternSelect.value) : 0;
               if (!webhookUrl || !webhookSecret) { return; }
 
               var textSpan = btn.querySelector('.test-webhook-text');
@@ -483,7 +593,7 @@ app.get('/link', async (req, res) => {
                   'Content-Type': 'application/json',
                   'x-webhook-secret': webhookSecret
                 },
-                body: JSON.stringify({ trigger: true })
+                body: JSON.stringify({ trigger: true, pattern_id: patternId })
               })
               .then(function(response) {
                 return response.json().then(function(data) {
@@ -493,7 +603,7 @@ app.get('/link', async (req, res) => {
               .then(function(result) {
                 // Reset button
                 btn.disabled = false;
-                textSpan.textContent = 'Test Device';
+                textSpan.textContent = 'Test Webhook Trigger';
                 spinnerSpan.style.display = 'none';
 
                 // Show feedback
@@ -509,7 +619,7 @@ app.get('/link', async (req, res) => {
               .catch(function(error) {
                 // Reset button
                 btn.disabled = false;
-                textSpan.textContent = 'Test Device';
+                textSpan.textContent = 'Test Webhook Trigger';
                 spinnerSpan.style.display = 'none';
 
                 // Show error feedback
@@ -753,10 +863,13 @@ app.post('/api/device/webhook/:deviceId', async (req, res) => {
     }
     
     // Set the trigger flag for device polling
-    await deviceStore.setTrigger(normalizedDeviceId, true);
+    // Also capture pattern_id from request body if provided
+    const patternId = req.body?.pattern_id !== undefined ? parseInt(req.body.pattern_id) : 0;
+
+    await deviceStore.setTrigger(normalizedDeviceId, true, patternId);
     // Create a trigger record in the triggers table for tracking
-    await deviceStore.createTrigger(normalizedDeviceId);
-    
+    await deviceStore.createTrigger(normalizedDeviceId, patternId);
+
     return res.json({ ok: true });
   } catch (error) {
     console.error('[WEBHOOK] webhook trigger failed', error);
@@ -798,11 +911,16 @@ app.get('/api/device/status', async (req, res) => {
     }
 
     const shouldTrigger = record.trigger;
+    const patternId = record.pattern_id !== undefined ? record.pattern_id : 0;
     if (shouldTrigger) {
       await deviceStore.setTrigger(normalizedDeviceId, false);
     }
 
-    return res.json({ ok: true, trigger: shouldTrigger });
+    const response = { ok: true, trigger: shouldTrigger };
+    if (shouldTrigger) {
+      response.pattern_id = patternId;
+    }
+    return res.json(response);
   } catch (error) {
     console.error('status poll failed', error);
     return res.status(500).json({ ok: false, msg: 'failed to fetch device status' });

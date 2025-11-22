@@ -26,6 +26,7 @@ const toCamelCaseRecord = (row) => {
     pollSecret: row.poll_secret,
     webhookSecret: row.webhook_secret,
     trigger: row.trigger,
+    patternId: row.pattern_id,
     webhookUrl: row.webhook_url,
     claimLookupUrl: row.claim_lookup_url,
   };
@@ -114,22 +115,32 @@ const deviceStore = {
     if (error) handleError('setSecrets failed', error);
   },
 
-  async setTrigger(deviceId, value) {
+  async setTrigger(deviceId, value, patternId) {
+    const updateData = { trigger: value };
+    if (patternId !== undefined) {
+      updateData.pattern_id = patternId;
+    }
+
     const { error } = await supabase
       .from(TABLE_NAME)
-      .update({ trigger: value })
+      .update(updateData)
       .eq('device_id', deviceId);
 
     if (error) handleError('setTrigger failed', error);
   },
 
-  async createTrigger(deviceId) {
+  async createTrigger(deviceId, patternId) {
+    const triggerData = {
+      device_id: deviceId,
+      triggered_at: new Date().toISOString(),
+    };
+    if (patternId !== undefined) {
+      triggerData.pattern_id = patternId;
+    }
+
     const { data, error } = await supabase
       .from(TRIGGERS_TABLE_NAME)
-      .insert({
-        device_id: deviceId,
-        triggered_at: new Date().toISOString(),
-      })
+      .insert(triggerData)
       .select()
       .single();
 
