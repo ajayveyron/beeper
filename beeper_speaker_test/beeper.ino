@@ -6,6 +6,9 @@
 #include <WiFiClient.h>
 #include <esp_wifi.h>
 
+// I2S audio playback using MAX98357 and ESP32-audioI2S `Audio` class
+#include "Audio.h"
+
 // ---------- Cloud configuration ----------
 const char *backendBaseUrl = "https://beeper-ps1z.onrender.com";
 const char *claimEndpointPath = "/api/device/claim";
@@ -15,8 +18,23 @@ const unsigned long pollIntervalMs = 3000;
 const unsigned long wifiConnectTimeoutMs = 20000;
 
 // ---------- Hardware ----------
-const int buzzerPin = 15;      // GPIO15
-const int resetButtonPin = 25; // GPIO0; connect to GND when pressed
+const int buzzerPin = 4;       // GPIO4 (moved off 15 to avoid I2S conflict)
+const int resetButtonPin = 14; // GPIO14; connect to GND when pressed
+
+// ---------- Audio (MAX98357 over I2S) ----------
+// For v1, we stream a short MP3 from a local HTTP server.
+// Option A: Node server at /audio/kalimba (port 3000)
+// Option B (current): Python SimpleHTTPServer on port 8001 serving Kalimba.mp3
+// Make sure the ESP32 can reach 192.168.1.9 over your LAN; update IP if needed.
+const char *alertMp3Url =
+    "http://192.168.1.9:8001/Kalimba.mp3"; // Using local HTTP server
+
+// I2S pin mapping for MAX98357 (update if you wired differently)
+const int audioBclkPin = 15;  // connect to MAX98357 BCLK
+const int audioLrcPin = 16;   // connect to MAX98357 LRC
+const int audioDataPin = 17;  // connect to MAX98357 DIN
+
+Audio audio; // ESP32-audioI2S player
 
 // ---------- Globals ----------
 Preferences prefs;
@@ -604,6 +622,23 @@ bool claimDevice() {
   return false;
 }
 
+// ---------- Audio helpers ----------
+void startAlertAudio() {
+  if (alertMp3Url == nullptr || alertMp3Url[0] == '\0') {
+    Serial.println("Audio: alertMp3Url is not set, skipping playback.");
+    return;
+  }
+
+  Serial.print("Audio: starting playback from URL via I2S: ");
+  Serial.println(alertMp3Url);
+
+  // Stop any previous stream
+  audio.stopSong();
+
+  // Kick off new stream; Audio library will handle HTTP + decode + I2S
+  audio.connecttohost(alertMp3Url);
+}
+
 void pollForTrigger() {
   if (pollSecret.isEmpty()) {
     return;
@@ -618,7 +653,6 @@ void pollForTrigger() {
   HTTPClient http;
   String url =
       String(backendBaseUrl) + pollEndpointPath + "?device_id=" + deviceId;
-
   http.begin(url);
   http.addHeader("x-poll-secret", pollSecret.c_str());
   http.addHeader("x-device-id", deviceId.c_str());
@@ -639,8 +673,9 @@ void pollForTrigger() {
     Serial.print("Status response: ");
     Serial.println(payload);
     if (payload.indexOf("\"trigger\":true") >= 0) {
-      Serial.println("Trigger detected. Beeping...");
-      beepPattern();
+      Serial.println("Trigger detected. Playing audio + beeping...");
+      startAlertAudio(); // Start MP3 playback over PAM8403
+      // beepPattern();     // Keep existing buzzer pattern for now
     }
     consecutivePollErrors = 0; // Reset error counter on success
   } else if (httpCode == 401) {
@@ -705,6 +740,7 @@ void beepPattern() {
 
 void setup() {
   Serial.begin(115200);
+
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
   pinMode(resetButtonPin, INPUT_PULLUP);
@@ -712,6 +748,11 @@ void setup() {
   prefs.begin("beeper", false);
 
   WiFi.mode(WIFI_STA);
+
+  // Configure MAX98357 I2S output
+  audio.setPinout(audioBclkPin, audioLrcPin, audioDataPin);
+  audio.setVolume(16); // 0..21
+
   deviceId = sanitizedMac();
   Serial.print("Device ID: ");
   Serial.println(deviceId);
@@ -733,6 +774,9 @@ void setup() {
 }
 
 void loop() {
+  // Keep audio decoding/streaming going
+  audio.loop();
+
   checkResetButton();
 
   if (configMode) {

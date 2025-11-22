@@ -1,8 +1,11 @@
 // server.js
+require('dotenv').config(); // loads .env into process.env
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const deviceStore = require('./deviceStore');
+const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'Lacubra534';
@@ -43,6 +46,19 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_req, res) => res.send('relay ok'));
+
+// Local test audio endpoint for ESP32 (serves MP3 over plain HTTP)
+app.get('/audio/kalimba', (_req, res) => {
+  const filePath = path.join(__dirname, 'Kalimba.mp3');
+  res.sendFile(filePath, (err) => {
+    if (err) {
+      console.error('Error sending kalimba audio file', err);
+      if (!res.headersSent) {
+        res.status(500).send('audio error');
+      }
+    }
+  });
+});
 
 const normalizeClaimCode = (value = '') => String(value).trim().toUpperCase();
 const normalizeDeviceId = (value = '') => String(value).trim().toUpperCase();
